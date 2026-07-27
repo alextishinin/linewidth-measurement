@@ -1,0 +1,195 @@
+# Laser linewidth measurement — SA210-8B + SA201B + PicoScope 5242D
+
+Live measurement of a CW laser's linewidth using a Thorlabs scanning
+Fabry-Pérot interferometer, with a PicoScope as the digitizer — a complete
+Python application with a live display, self-calibrating frequency axis,
+Lorentzian fitting, auto-gain, and CSV export.
+
+![status](https://img.shields.io/badge/platform-Windows-blue)
+![python](https://img.shields.io/badge/python-3.12%2B-green)
+
+## Hardware
+
+| Instrument | Role |
+|---|---|
+| Thorlabs **SA210-8B** scanning Fabry-Pérot (FSR 10 GHz, resolution 67 MHz, 820–1275 nm) | the interferometer |
+| Thorlabs **SA201B** controller | piezo ramp generator + photodiode amplifier (USB-controlled) |
+| Pico Technology **PicoScope 5242D** | digitizer for the spectrum signal (any 5000D-series model should work) |
+| 3× BNC cables + the SMA→BNC cable shipped with the SA210 | wiring below |
+
+Other SA210/SA200-series cavities work too — pass your FSR with `--fsr-ghz`.
+
+## Installation
+
+1. Windows 10/11 with Python 3.12+ (`winget install Python.Python.3.12`).
+2. `pip install -r requirements.txt`
+   (numpy, scipy, matplotlib, pyserial, picosdk).
+3. Install **PicoSDK 64-bit** from
+   [picotech.com/downloads](https://www.picotech.com/downloads) — provides
+   `ps5000a.dll` (default location `C:\Program Files\Pico Technology\SDK`,
+   which `config.py` points at).
+4. Plug in the SA201B (USB) and the PicoScope (USB 3), wire as below, and run
+   `run.bat` (edit the Python path inside if yours differs) or
+   `python linewidth_live.py`.
+
+## How it works
+
+The SA201B drives the SA210's piezo with a sawtooth, sweeping the cavity
+length. Each time the cavity comes into resonance with the laser, a
+transmission peak appears on the photodiode. The same laser line repeats every
+free spectral range, so the time between two repeats equals exactly **10 GHz**
+— that calibrates the time axis into optical frequency with no assumptions
+about wavelength, piezo gain, or ramp slope. The program then fits a
+Lorentzian to the tallest peak; its FWHM in calibrated units is the measured
+linewidth.
+
+**Resolution floor:** the measured width is the laser lineshape *convolved*
+with the instrument function (~67 MHz). A laser much narrower than 67 MHz
+shows ≈67 MHz regardless — that reading means "narrower than the instrument",
+and the effective finesse readout (FSR / measured width ≥ 150) confirms the
+interferometer is performing to spec. For broader lasers the program also
+shows a deconvolved estimate (measured − 67 MHz, valid for Lorentzian-ish
+shapes).
+
+## Wiring
+
+| From | To | Cable |
+|---|---|---|
+| SA210 attached cable (piezo) | SA201B rear **OUTPUT** (0–45 V) | its own BNC |
+| SA210 detector SMA | SA201B rear **PD AMPLIFIER IN** | SMA→BNC (supplied) |
+| SA201B front **PD AMPLIFIER OUT** | PicoScope **Channel A** | BNC coax |
+| SA201B front **TRIGGER OUT** | PicoScope **EXT** | BNC coax |
+| SA201B rear **MONITOR OUT** | PicoScope **Channel B** | BNC coax (recommended) |
+| SA201B USB-B + PicoScope USB-B | this PC | USB |
+
+Channel B is optional but recommended: the program uses the ramp monitor to
+measure the true sweep duration each capture. Without it, pass
+`--single-channel` (the scope then runs 16-bit instead of 15-bit).
+
+## Optical setup (from the SA210 manual)
+
+* Mount the SA210 in a Ø1" kinematic mount (KM100), beam ~1 mm.
+* Fold mirror into the input iris; f = 100 mm lens focused at the cavity
+  center, ~25 mm past the front flange.
+* To align: close the input iris, open the back iris, scan running, center the
+  beam; watch the live "Full sweep" panel while tweaking tip/tilt until peaks
+  appear, then maximize their height and symmetry. Sharp, tall, non-split
+  peaks = good alignment.
+
+## Running
+
+There is one command — double-click `run.bat` (or `python linewidth_live.py`).
+Both instruments must be connected; if the scope can't be opened the program
+exits with a clear message. Inside the app:
+
+* **Mode button** — switches between **Live** streaming and **Single** sweep.
+* **Run once button** — in single mode, captures and displays exactly one
+  fresh sweep, then freezes.
+
+`python test_analysis.py` runs the analysis self-test (it uses the synthetic
+source in `simulator.py`; the measurement app itself is hardware-only).
+CLI flags (below) exist as optional startup presets for scripting.
+
+On startup the program configures the SA201B over USB (sawtooth, 30 V
+amplitude ≈ 3 FSR, 10 ms sweep, blanking on) and then continuously:
+captures one sweep per trigger → finds peaks → calibrates Hz/s from the
+10 GHz peak spacing → fits the main peak → updates the plots and the CSV log
+in `logs\`.
+
+**Live vs. single-sweep mode.** By default the scope captures and the display
+streams continuously. The **Mode** button (or `m`) switches to single-sweep
+mode, where the scope is *idle* — no data is acquired at all (the PicoScope
+LED stops flashing). Each click of **Run once** (or `r`) arms exactly one
+capture (or N sweeps with `--avg N`): the sweep is taken, analyzed, displayed,
+and acquisition stops again until the next run. Handy for documenting discrete
+measurements — each run adds one point to the history panel, and old points
+don't expire. Start directly in this mode with `--single`.
+
+### Useful options
+
+| Option | Meaning |
+|---|---|
+| `--single` | start in single-sweep mode |
+| `--wavelength-nm 1064` | laser wavelength for the Δλ display (editable in-app) |
+| `--amplitude 30` | ramp volts (30 V ≈ 3 FSR on the SA210) |
+| `--risetime-step 0` | 0..200 → 10..100 ms sweep (slower = more samples/peak) |
+| `--pdgain auto` | photodiode amp gain 10k/100k/1M V/A, or `0`/`1`/`2` fixed |
+| `--avg 4` | average 4 triggered sweeps before analysis |
+| `--single-channel` | MONITOR OUT not wired to channel B |
+| `--no-controller` | leave the SA201B alone (touchscreen control) |
+| `--dt-us 0.5` | sample interval (0.5 µs ≈ 45 samples across 67 MHz) |
+| `--window-ms` / `--rise-ms` | manual capture window / sweep time |
+
+### In-app controls
+
+The side panel has, top to bottom: a **λ nm (100–5000)** input box (sets the
+wavelength used for the Δλ display and exports — type a value and press
+Enter), **scan controls**, a **PD gain (V/A)** dropdown, **Run once** /
+**Mode** buttons, and **Export data** / **Align** buttons. Every input box
+shows its valid range in the label; dropdowns are native and show all
+choices.
+
+**Scan controls** (live — no restart needed): **ampl V (1–30)** (ramp ≈ 1 V
+per GHz of span), **offs V (0–15)** (shifts the pattern; also ←/→ keys),
+**sweep ms (10–100)** (sweep time at 1×; snapped to the SA201B's step grid),
+and the **expand** dropdown (1×–100× sweep expansion). Changing the sweep
+time or expansion automatically resizes the scope's capture window (long
+sweeps also coarsen the sample interval to keep captures manageable).
+
+**Align** (`t` key) switches the SA201B to a **triangle** scan — the manual's
+recommended waveform for initial cavity alignment — and the headline changes
+from linewidth to **peak height in volts**: walk the mirror mount to maximize
+that number. Alignment sweeps are excluded from the history plot and CSV log.
+Click again to return to sawtooth measurement mode.
+
+**PD gain (V/A) dropdown:** *Auto* (the default) adjusts the SA201B
+photodiode amplifier both ways — it steps the gain *down* when the 5 V output
+saturates and *up* when the peak falls below ~0.35 V (with a few-second
+cooldown). Selecting 10k/100k/1M locks that transimpedance gain manually;
+selecting Auto hands control back. The dropdown always shows the current
+choice (the stats line shows the actual gain Auto has picked).
+
+**Export:** writes the currently displayed data to `exports\` as two CSVs —
+`sweep_*.csv` (time, signal, calibrated frequency offset, Lorentzian fit,
+with a `#` metadata header: λ, FSR, calibration, FWHM in MHz and pm, finesse,
+gain) and `history_*.csv` (the linewidth-vs-time trend in MHz and pm). Works
+in live or single mode.
+
+**Theme:** the app starts in **dark mode**; the button in the top-right
+corner (or the `d` key) switches between dark and light. Launch with
+`--theme light` to start light. Snapshots save in whichever theme is active.
+
+**Keys:** `r` run one sweep · `m` live/single mode · `t` alignment mode ·
+`g` cycle PD gain · `a` toggle auto-gain · `e` export data · `d` theme ·
+`←/→` DC offset ±0.25 V · `s` snapshot PNG+CSV · `p` pause display ·
+`q` quit. (Keys are ignored while typing in any input box.)
+
+## Interpreting the display
+
+* **Full sweep** — every transmission peak along the 30 V ramp; expect the
+  same pattern ~3× (once per FSR). Use this panel while aligning.
+* **Main peak** — zoomed, frequency-calibrated view with the Lorentzian fit.
+  Multiple peaks inside one FSR = multiple longitudinal modes; their spacings
+  are listed in the side panel.
+* **History** — measured FWHM vs. time; drift/jitter of the sweep shows up
+  here. The CSV log has every value with timestamps.
+
+## Files
+
+| File | Role |
+|---|---|
+| `linewidth_live.py` | main live application |
+| `analysis.py` | peak finding, FSR calibration, Lorentzian fit |
+| `sa201b.py` | SA201B USB-serial driver (verified protocol) |
+| `pico5000a.py` | PicoScope 5000D block-mode acquisition |
+| `simulator.py` | synthetic source used only by the self-test |
+| `test_analysis.py` | pipeline self-test against the simulator |
+| `config.py` | FSR, resolution, ports, palette |
+
+## Requirements
+
+Python 3.12 with `numpy scipy matplotlib pyserial picosdk`
+(`pip install -r requirements.txt`) and the Pico Technology **PicoSDK**
+(provides `ps5000a.dll`; installed at `C:\Program Files\Pico Technology\SDK`).
+Close the PicoScope 7 desktop app before running — only one program can own
+the scope at a time.
