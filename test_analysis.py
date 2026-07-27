@@ -21,7 +21,7 @@ def main() -> int:
     fsr_period_true = config.FSR_HZ / hz_per_s_true
     width_true = config.FSR_HZ / scope.FINESSE          # 66.7 MHz Airy FWHM
 
-    lws, fsrs, mode_counts = [], [], []
+    lws, fsrs, mode_counts, errs = [], [], [], []
     for _ in range(8):
         cap = scope.capture()
         t, v, _ = ana.trim_to_rising_ramp(cap, rise)
@@ -31,6 +31,8 @@ def main() -> int:
         fsrs.append(res.fsr_period_s)
         mode_counts.append(len(res.mode_offsets_hz))
         assert res.fit_r2 is None or res.fit_r2 > 0.9, f"poor fit R2={res.fit_r2}"
+        if res.fit_fwhm_err_s is not None:
+            errs.append(res.fit_fwhm_err_s * res.hz_per_s)
 
     lw = np.median(lws)
     fsr_p = np.median(fsrs)
@@ -42,6 +44,13 @@ def main() -> int:
     assert abs(lw - width_true) / width_true < 0.15, "linewidth off by >15%"
     assert abs(fsr_p - fsr_period_true) / fsr_period_true < 0.06, "FSR period off by >6%"
     assert np.median(mode_counts) >= 2, "multi-mode structure not resolved"
+
+    # Fit uncertainty must exist, be positive, and be small for clean data.
+    assert errs, "fit produced no width uncertainty"
+    err = float(np.median(errs))
+    print(f"fit uncertainty: {err / 1e6:.2f} MHz "
+          f"({100 * err / lw:.1f}% of the linewidth)")
+    assert 0 < err < 0.2 * lw, f"implausible fit uncertainty {err:.3g} Hz"
 
     # Wavelength-unit conversion helper.
     v, u = ana.wavelength_width(3e9, 1064.0)

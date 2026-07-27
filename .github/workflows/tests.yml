@@ -1,0 +1,36 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  analysis:
+    name: analysis self-test (simulated hardware)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # The measurement pipeline runs against simulator.py, so no PicoSDK,
+      # no serial port and no instruments are needed -- numpy + scipy only.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy scipy
+
+      - name: Byte-compile the hardware-independent modules
+        run: python -m py_compile analysis.py simulator.py capture.py config.py test_analysis.py
+
+      - name: Run analysis self-test
+        run: python test_analysis.py

@@ -49,6 +49,7 @@ class SweepAnalysis:
     fit_v: np.ndarray | None = None
     fit_center_s: float | None = None
     fit_fwhm_s: float | None = None
+    fit_fwhm_err_s: float | None = None    # 1-sigma from the fit covariance
     fit_r2: float | None = None
     fwhm_direct_s: float | None = None     # half-max crossings, fit-free
     # results in frequency units
@@ -237,8 +238,8 @@ def analyze_sweep(t: np.ndarray, v: np.ndarray,
         p0 = [heights[i_main], t_main, w0 / 2, baseline]
         lb = [0.2 * heights[i_main], ts[0], dt / 2, -1.0]
         ub = [3.0 * heights[i_main], ts[-1], (ts[-1] - ts[0]), 2.0]
-        popt, _ = curve_fit(_lorentzian, ts, vs, p0=p0, bounds=(lb, ub),
-                            maxfev=4000)
+        popt, pcov = curve_fit(_lorentzian, ts, vs, p0=p0, bounds=(lb, ub),
+                               maxfev=4000)
         model = _lorentzian(ts, *popt)
         ss_res = float(np.sum((vs - model) ** 2))
         ss_tot = float(np.sum((vs - vs.mean()) ** 2)) or 1.0
@@ -246,6 +247,12 @@ def analyze_sweep(t: np.ndarray, v: np.ndarray,
         out.fit_t, out.fit_v = ts, model
         out.fit_center_s = float(popt[1])
         out.fit_fwhm_s = float(2.0 * popt[2])
+        try:
+            var = float(pcov[2, 2])
+            if np.isfinite(var) and var >= 0:
+                out.fit_fwhm_err_s = float(2.0 * np.sqrt(var))
+        except Exception:
+            pass
     except Exception:
         out.fit_fwhm_s = None
 

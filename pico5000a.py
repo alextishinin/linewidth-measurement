@@ -16,11 +16,11 @@ import atexit
 import ctypes
 import os
 import time
-from dataclasses import dataclass
 
 import numpy as np
 
 import config
+from capture import Capture
 
 if os.path.isdir(config.PICO_SDK_LIB):  # make ps5000a.dll findable
     os.add_dll_directory(config.PICO_SDK_LIB)
@@ -30,16 +30,6 @@ from picosdk.ps5000a import ps5000a as ps  # noqa: E402
 from picosdk.functions import assert_pico_ok  # noqa: E402
 
 _POWER_STATUS = {282, 286}  # USB-power notifications, not errors on 2ch units
-
-
-@dataclass
-class Capture:
-    t: np.ndarray            # seconds, 0 = trigger (= ramp start)
-    pd: np.ndarray           # channel A volts (photodiode amplifier out)
-    monitor: np.ndarray | None  # channel B volts (ramp/10) or None
-    dt: float
-    triggered: bool          # False if the auto-trigger timeout fired
-    clipped: bool            # ADC over-range on channel A
 
 
 class PicoScopeError(RuntimeError):

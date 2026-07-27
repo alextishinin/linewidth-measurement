@@ -16,6 +16,7 @@ import argparse
 import collections
 import csv
 import datetime as _dt
+import json
 import os
 import sys
 import threading
@@ -29,6 +30,64 @@ import analysis as ana
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(HERE, "logs")
 EXPORT_DIR = os.path.join(HERE, "exports")
+SETTINGS_PATH = os.path.join(HERE, "settings.json")
+
+
+def _ms_to_step(ms: float) -> int:
+    lo = config.RISETIME_MIN_S * 1e3
+    hi = config.RISETIME_MAX_S * 1e3
+    step = int(round((ms - lo) / (hi - lo) * config.RISETIME_STEPS))
+    return max(0, min(config.RISETIME_STEPS, step))
+
+
+def load_saved_settings() -> dict:
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def resolve_args(args) -> None:
+    """Fill unset CLI options from settings.json, then built-in defaults.
+
+    Precedence: explicit CLI flag > last session's saved value > default.
+    """
+    saved = load_saved_settings()
+
+    def pick(cli_value, key, builtin):
+        if cli_value is not None:
+            return cli_value
+        return saved.get(key, builtin)
+
+    args.wavelength_nm = float(pick(args.wavelength_nm, "wavelength_nm", 1064.0))
+    args.theme = pick(args.theme, "theme", "dark")
+    args.amplitude = float(pick(args.amplitude, "amplitude_v", 30.0))
+    args.offset = float(pick(args.offset, "offset_v", 0.0))
+    args.sweep_expand = int(pick(args.sweep_expand, "expand_idx", 0))
+    if args.risetime_step is None:
+        ms = saved.get("sweep_ms")
+        args.risetime_step = _ms_to_step(float(ms)) if ms is not None else 0
+    if args.pdgain is None:
+        if saved.get("gain_auto", True):
+            args.pdgain = "auto"
+        else:
+            args.pdgain = str(int(saved.get("gain_idx", 0)))
+
+
+def _is_ctrl_error(exc) -> bool:
+    """True for exceptions that mean the SA201B serial link is gone."""
+    if isinstance(exc, ValueError):
+        return False
+    try:
+        import serial
+        from sa201b import SA201BError
+        if isinstance(exc, (serial.SerialException, SA201BError)):
+            return True
+    except Exception:
+        pass
+    return isinstance(exc, OSError)
 
 
 def _decimate_envelope(x, y, max_bins: int = 1200):
@@ -63,15 +122,17 @@ def parse_args():
                    help="don't talk to the SA201B (use its touchscreen instead)")
     p.add_argument("--single-channel", action="store_true",
                    help="PD only on ch A at 16 bit (MONITOR OUT not wired to ch B)")
-    p.add_argument("--amplitude", type=float, default=30.0,
-                   help="ramp amplitude in V (default 30 -> ~3 FSR)")
-    p.add_argument("--offset", type=float, default=0.0, help="DC offset in V")
-    p.add_argument("--risetime-step", type=int, default=0,
-                   help="SA201B rise-time step 0..200 (0 = 10 ms sweep)")
-    p.add_argument("--sweep-expand", type=int, default=0, choices=range(7),
-                   help="sweep expansion index 0..6 (1x..100x)")
-    p.add_argument("--pdgain", default="auto", choices=["auto", "0", "1", "2"],
-                   help="PD amplifier gain index, or auto")
+    p.add_argument("--amplitude", type=float, default=None,
+                   help="ramp amplitude in V (default 30 -> ~3 FSR; persisted)")
+    p.add_argument("--offset", type=float, default=None,
+                   help="DC offset in V (persisted)")
+    p.add_argument("--risetime-step", type=int, default=None,
+                   help="SA201B rise-time step 0..200 (0 = 10 ms sweep; "
+                        "persisted as sweep ms)")
+    p.add_argument("--sweep-expand", type=int, default=None, choices=range(7),
+                   help="sweep expansion index 0..6 (1x..100x; persisted)")
+    p.add_argument("--pdgain", default=None, choices=["auto", "0", "1", "2"],
+                   help="PD amplifier gain index, or auto (persisted)")
     p.add_argument("--rise-ms", type=float, default=None,
                    help="sweep rise time in ms when not using the controller")
     p.add_argument("--dt-us", type=float, default=0.5,
@@ -80,11 +141,12 @@ def parse_args():
                    help="capture window in ms (default: auto from rise time)")
     p.add_argument("--avg", type=int, default=1,
                    help="average N consecutive triggered sweeps (default 1)")
-    p.add_argument("--wavelength-nm", type=float, default=1064.0,
+    p.add_argument("--wavelength-nm", type=float, default=None,
                    help="laser wavelength in nm for the wavelength-units "
-                        "display (editable in the app)")
-    p.add_argument("--theme", choices=["dark", "light"], default="dark",
-                   help="UI color theme (default dark; toggle in-app)")
+                        "display (editable in the app; persisted)")
+    p.add_argument("--theme", choices=["dark", "light"], default=None,
+                   help="UI color theme (default dark; toggle in-app; "
+                        "persisted)")
     p.add_argument("--fsr-ghz", type=float, default=config.FSR_HZ / 1e9,
                    help="interferometer FSR in GHz (SA210 = 10)")
     p.add_argument("--instrument-mhz", type=float,
@@ -307,6 +369,7 @@ class LiveApp:
     GAIN_NAMES = {0: "10k V/A", 1: "100k V/A", 2: "1M V/A"}
 
     def __init__(self, args):
+        resolve_args(args)               # idempotent; covers direct callers
         self.args = args
         self.fsr_hz = args.fsr_ghz * 1e9
         self.instrument_hz = args.instrument_mhz * 1e6
@@ -327,7 +390,14 @@ class LiveApp:
         self.scan_expand_idx = int(args.sweep_expand)
         self.ctrl, self.scope, self.rise_s = open_hardware(args)
         self.acq = self._new_acquirer()
-        self.auto_gain = args.pdgain == "auto" and self.ctrl is not None
+        # auto_gain is user *intent*; a missing controller only gates its
+        # effect, so intent survives USB dropouts and reconnects
+        self.auto_gain = args.pdgain == "auto"
+        self._ctrl_retry_at = 0.0
+        self._ctrl_reconnecting = False
+        self._ctrl_restored = False
+        self._fsr_hist = collections.deque(maxlen=20)
+        self._last_err_hz = None
         self._gain_cooldown_until = 0.0
         # cached copy of the SA201B gain index -- querying the device takes
         # ~100 ms of serial I/O, far too slow for the per-frame UI path
@@ -351,7 +421,7 @@ class LiveApp:
                 ["unix_time", "iso_time", "linewidth_hz", "linewidth_direct_hz",
                  "deconvolved_hz", "finesse", "fsr_period_s", "hz_per_s",
                  "peak_v", "n_modes", "pd_gain_index", "wavelength_nm",
-                 "linewidth_pm", "flags"])
+                 "linewidth_pm", "linewidth_err_hz", "flags"])
         self._build_figure()
 
     def _new_acquirer(self) -> Acquirer:
@@ -776,6 +846,8 @@ class LiveApp:
             print(f"[scan] amplitude -> {v:g} V")
         except Exception as exc:
             self.txt_status.set_text(f"amplitude not set: {exc}")
+            if _is_ctrl_error(exc):
+                self._note_ctrl_failure(exc)
         self._norm_box(self.box_amplitude, f"{self.scan_amplitude:g}")
 
     def _on_offset_box(self, text):
@@ -793,6 +865,8 @@ class LiveApp:
             print(f"[scan] DC offset -> {v:g} V")
         except Exception as exc:
             self.txt_status.set_text(f"offset not set: {exc}")
+            if _is_ctrl_error(exc):
+                self._note_ctrl_failure(exc)
         self._norm_box(self.box_offset, f"{self.scan_offset:g}")
 
     def _on_sweep_box(self, text):
@@ -816,6 +890,8 @@ class LiveApp:
                   f"(step {step})")
         except Exception as exc:
             self.txt_status.set_text(f"sweep time not set: {exc}")
+            if _is_ctrl_error(exc):
+                self._note_ctrl_failure(exc)
         self._norm_box(self.box_sweep, f"{self.scan_sweep_ms:g}")
 
     def _sync_expand_combo(self):
@@ -833,6 +909,8 @@ class LiveApp:
                   f"{config.SWEEP_EXPANSION_FACTORS[idx]}x")
         except Exception as exc:
             self.txt_status.set_text(f"expansion not set: {exc}")
+            if _is_ctrl_error(exc):
+                self._note_ctrl_failure(exc)
         self._sync_expand_combo()
 
     def _on_expand_combo(self, label):
@@ -847,6 +925,8 @@ class LiveApp:
                 print(f"[align] {'triangle scan (alignment)' if self.align_mode else 'sawtooth scan (measurement)'}")
             except Exception as exc:
                 self.txt_status.set_text(f"waveform switch failed: {exc}")
+                if _is_ctrl_error(exc):
+                    self._note_ctrl_failure(exc)
         else:
             self._no_ctrl_hint()
         self.btn_align.label.set_text(
@@ -874,6 +954,8 @@ class LiveApp:
             except Exception as exc:
                 print(f"[gain] failed: {exc}")
                 self.txt_status.set_text(f"gain set failed: {exc}")
+                if _is_ctrl_error(exc):
+                    self._note_ctrl_failure(exc)
         self._sync_gain_combo()
 
     def _on_gain_combo(self, label):
@@ -907,6 +989,9 @@ class LiveApp:
             if res.linewidth_hz:
                 wv, wu = ana.wavelength_width(res.linewidth_hz, lam)
                 fh.write(f"# fwhm_mhz: {res.linewidth_hz / 1e6:.4f}\n")
+                if self._last_err_hz:
+                    fh.write(f"# fwhm_err_mhz_1sigma: "
+                             f"{self._last_err_hz / 1e6:.4f}\n")
                 fh.write(f"# fwhm_wavelength: {wv:.4g} {wu}\n")
             if res.finesse:
                 fh.write(f"# effective_finesse: {res.finesse:.1f}\n")
@@ -972,10 +1057,7 @@ class LiveApp:
             if self.ctrl is not None:
                 self.auto_gain = not self.auto_gain
                 if not self.auto_gain:
-                    try:
-                        self._manual_gain_idx = self.ctrl.pd_gain_index
-                    except Exception:
-                        self._manual_gain_idx = 0
+                    self._manual_gain_idx = self._gain_cache
                 print(f"[gain] auto-gain {'ON' if self.auto_gain else 'OFF'}")
                 self._sync_gain_combo()
         elif event.key == "g" and self.ctrl is not None:
@@ -988,17 +1070,21 @@ class LiveApp:
                 print(f"[gain] manual -> {self.GAIN_NAMES[g]} (auto-gain off)")
             except Exception as exc:
                 print(f"[gain] failed: {exc}")
+                if _is_ctrl_error(exc):
+                    self._note_ctrl_failure(exc)
             self._sync_gain_combo()
         elif event.key in ("left", "right") and self.ctrl is not None:
             try:
                 delta = 0.25 if event.key == "right" else -0.25
-                new = float(np.clip(self.ctrl.dc_offset_v + delta, 0.0, 15.0))
+                new = float(np.clip(self.scan_offset + delta, 0.0, 15.0))
                 self.ctrl.dc_offset_v = new
                 self.scan_offset = new
                 self._norm_box(self.box_offset, f"{new:g}")
                 print(f"[offset] DC offset -> {new:.2f} V")
             except Exception as exc:
                 print(f"[offset] failed: {exc}")
+                if _is_ctrl_error(exc):
+                    self._note_ctrl_failure(exc)
 
     def _snapshot(self):
         os.makedirs(LOG_DIR, exist_ok=True)
@@ -1021,6 +1107,99 @@ class LiveApp:
                 w.writerow(["time_s", "signal_v"])
                 w.writerows(zip(res.t, res.v))
         print(f"[snapshot] saved {png}")
+
+    # ------------------------------------------------------------- settings
+    def save_settings(self) -> None:
+        """Persist the user's choices for the next launch."""
+        data = {
+            "wavelength_nm": self.wavelength_nm,
+            "theme": self.theme_name,
+            "amplitude_v": self.scan_amplitude,
+            "offset_v": self.scan_offset,
+            "sweep_ms": self.scan_sweep_ms,
+            "expand_idx": self.scan_expand_idx,
+            "gain_auto": bool(self.auto_gain),
+            "gain_idx": int(self._manual_gain_idx),
+        }
+        try:
+            with open(SETTINGS_PATH, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+            print(f"[settings] saved to {os.path.basename(SETTINGS_PATH)}")
+        except Exception as exc:
+            print(f"[settings] could not save: {exc}")
+
+    # ---------------------------------------------------------- uncertainty
+    def _uncertainty_hz(self, res):
+        """1-sigma uncertainty on the linewidth, in Hz.
+
+        Two independent contributions, added in quadrature:
+          * the Lorentzian fit's own covariance on the width, and
+          * the frequency calibration, whose scale (Hz per second of sweep)
+            is set by the FSR peak spacing and jitters sweep to sweep. Its
+            relative error propagates directly into the width.
+        """
+        if not res.ok or not res.linewidth_hz or not res.fsr_period_s:
+            return None
+        self._fsr_hist.append(res.fsr_period_s)
+        rel_cal = 0.0
+        if len(self._fsr_hist) >= 3:
+            arr = np.fromiter(self._fsr_hist, dtype=float)
+            mean = float(arr.mean())
+            if mean > 0:
+                # standard error of the mean period -> relative scale error
+                rel_cal = float(arr.std(ddof=1)) / mean / np.sqrt(len(arr))
+        err_cal = res.linewidth_hz * rel_cal
+        err_fit = 0.0
+        if res.fit_fwhm_err_s and res.hz_per_s:
+            err_fit = res.fit_fwhm_err_s * res.hz_per_s
+        total = float(np.hypot(err_fit, err_cal))
+        return total if np.isfinite(total) and total > 0 else None
+
+    # ------------------------------------------------- SA201B auto-reconnect
+    def _note_ctrl_failure(self, exc) -> None:
+        """Serial link died: drop the controller and let the watchdog retry."""
+        if self.ctrl is None:
+            return
+        print(f"[SA201B] connection lost: {exc}")
+        try:
+            self.ctrl.close()
+        except Exception:
+            pass
+        self.ctrl = None
+        self._ctrl_retry_at = time.monotonic() + 2.0
+
+    def _ctrl_watchdog(self) -> None:
+        """Called every UI tick; re-attaches the SA201B when it comes back."""
+        if self._ctrl_restored:
+            self._ctrl_restored = False
+            self._sync_gain_combo()      # UI updates on the UI thread only
+        if (self.ctrl is not None or self.args.no_controller
+                or self._ctrl_reconnecting
+                or time.monotonic() < self._ctrl_retry_at):
+            return
+        self._ctrl_reconnecting = True
+
+        def _worker():
+            try:
+                from sa201b import SA201B
+                ctrl = SA201B(port=self.args.port)
+                ctrl.apply_scan_settings(
+                    amplitude_v=self.scan_amplitude,
+                    dc_offset_v=self.scan_offset,
+                    risetime_step=_ms_to_step(self.scan_sweep_ms),
+                    sweep_expand_index=self.scan_expand_idx,
+                    pd_gain_index=self._gain_cache)
+                ctrl.sawtooth = not self.align_mode
+                self.ctrl = ctrl
+                self._ctrl_restored = True
+                print(f"[SA201B] reconnected on {ctrl.port}; "
+                      f"settings re-applied")
+            except Exception:
+                self._ctrl_retry_at = time.monotonic() + 4.0
+            finally:
+                self._ctrl_reconnecting = False
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     # ------------------------------------------------------------ auto gain
     def _auto_gain_step(self, res):
@@ -1049,6 +1228,8 @@ class LiveApp:
                 print(f"[gain] {why} -> {self.GAIN_NAMES[target]}")
             except Exception as exc:
                 print(f"[gain] auto-gain failed: {exc}")
+                if _is_ctrl_error(exc):
+                    self._note_ctrl_failure(exc)
             finally:
                 self._gain_busy = False
 
@@ -1076,6 +1257,7 @@ class LiveApp:
             f"{self.wavelength_nm:g}",
             (f"{ana.delta_lambda_m(res.linewidth_hz, self.wavelength_nm) * 1e12:.6g}"
              if res.linewidth_hz else ""),
+            f"{self._last_err_hz:.6g}" if self._last_err_hz else "",
             flags])
         if int(now) % 5 == 0:
             self._log_file.flush()
@@ -1084,6 +1266,7 @@ class LiveApp:
     def _update(self, _frame):
         if self.paused or self.acq is None:
             return
+        self._ctrl_watchdog()      # re-attach the SA201B if its USB returns
         item = self.acq.averaged()
         if item is None or item[0] == self._last_processed:
             return
@@ -1102,6 +1285,7 @@ class LiveApp:
                                 instrument_hz=self.instrument_hz)
         self.last_result = res
         self._auto_gain_step(res)
+        self._last_err_hz = self._uncertainty_hz(res)
         if not self.align_mode:      # alignment sweeps don't pollute the log
             self._log(res)
 
@@ -1176,7 +1360,11 @@ class LiveApp:
             self.txt_sub.set_text(
                 "alignment — maximize peak height (triangle scan)")
         elif res.ok and res.linewidth_hz:
-            self.txt_head.set_text(f"{res.linewidth_hz / 1e6:.1f} MHz")
+            err = self._last_err_hz
+            head = f"{res.linewidth_hz / 1e6:.1f}"
+            if err:
+                head += f" ± {err / 1e6:.1f}"
+            self.txt_head.set_text(head + " MHz")
             wl_v, wl_u = ana.wavelength_width(res.linewidth_hz,
                                               self.wavelength_nm)
             note = ("instrument-limited"
@@ -1192,6 +1380,10 @@ class LiveApp:
         stats = []
         if self.mode == "single" and self._last_single_stamp:
             stats.append(f"single sweep captured {self._last_single_stamp}")
+        if self._last_err_hz and res.linewidth_hz:
+            frac = 100.0 * self._last_err_hz / res.linewidth_hz
+            stats.append(f"uncertainty: ±{self._last_err_hz / 1e6:.2f} MHz "
+                         f"({frac:.1f}%, 1σ)")
         if res.linewidth_direct_hz:
             stats.append(f"half-max width: {res.linewidth_direct_hz / 1e6:.1f} MHz")
         if res.fit_r2 is not None:
@@ -1230,9 +1422,11 @@ class LiveApp:
         if not res.ok:
             warn.append(res.message)
         if res.saturating:
-            warn.append("⚠ signal saturating — lower PD gain / input power")
+            warn.append("! signal saturating — lower PD gain / input power")
         if cap.clipped:
-            warn.append("⚠ scope ADC clipped")
+            warn.append("! scope ADC clipped")
+        if self.ctrl is None and not self.args.no_controller:
+            warn.append("! SA201B USB disconnected — retrying...")
         if self.acq.status not in ("ok", "starting"):
             warn.append(self.acq.status)
         self.txt_status.set_text("\n".join(warn))
@@ -1266,6 +1460,7 @@ class LiveApp:
                 self._timer.stop()
             except Exception:
                 pass
+            self.save_settings()
             self.acq.shutdown()          # aborts in-flight captures, closes scope
             if self.ctrl is not None:
                 self.ctrl.close()
@@ -1277,6 +1472,7 @@ class LiveApp:
 
 def main():
     args = parse_args()
+    resolve_args(args)
     print("=" * 64)
     print("SA210 / SA201B / PicoScope 5242D - live laser linewidth")
     print("=" * 64)

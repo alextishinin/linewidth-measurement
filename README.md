@@ -5,8 +5,10 @@ Fabry-Pérot interferometer, with a PicoScope as the digitizer — a complete
 Python application with a live display, self-calibrating frequency axis,
 Lorentzian fitting, auto-gain, and CSV export.
 
-![status](https://img.shields.io/badge/platform-Windows-blue)
-![python](https://img.shields.io/badge/python-3.12%2B-green)
+[![tests](https://github.com/alextishinin/linewidth-measurement/actions/workflows/tests.yml/badge.svg)](https://github.com/alextishinin/linewidth-measurement/actions/workflows/tests.yml)
+![platform](https://img.shields.io/badge/platform-Windows-blue)
+![python](https://img.shields.io/badge/python-3.11%2B-green)
+[![license](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
 ## Hardware
 
@@ -50,6 +52,12 @@ and the effective finesse readout (FSR / measured width ≥ 150) confirms the
 interferometer is performing to spec. For broader lasers the program also
 shows a deconvolved estimate (measured − 67 MHz, valid for Lorentzian-ish
 shapes).
+
+**Uncertainty:** the headline reads `78.3 ± 2.1 MHz`. The 1σ error bar
+combines, in quadrature, the Lorentzian fit's own covariance on the width
+and the frequency-calibration error (the standard error of the FSR peak
+spacing over the last 20 sweeps, which sets the Hz-per-second scale). It is
+recorded in the CSV log and in exported files.
 
 ## Wiring
 
@@ -107,13 +115,18 @@ don't expire. Start directly in this mode with `--single`.
 
 ### Useful options
 
+Options marked *(persisted)* default to whatever you last used in the app —
+see **Settings are remembered** below.
+
 | Option | Meaning |
 |---|---|
 | `--single` | start in single-sweep mode |
-| `--wavelength-nm 1064` | laser wavelength for the Δλ display (editable in-app) |
-| `--amplitude 30` | ramp volts (30 V ≈ 3 FSR on the SA210) |
-| `--risetime-step 0` | 0..200 → 10..100 ms sweep (slower = more samples/peak) |
-| `--pdgain auto` | photodiode amp gain 10k/100k/1M V/A, or `0`/`1`/`2` fixed |
+| `--wavelength-nm 1064` | laser wavelength for the Δλ display *(persisted)* |
+| `--theme dark` | `dark` (default) or `light` *(persisted)* |
+| `--amplitude 30` | ramp volts, 30 V ≈ 3 FSR on the SA210 *(persisted)* |
+| `--risetime-step 0` | 0..200 → 10..100 ms sweep *(persisted)* |
+| `--sweep-expand 0` | expansion index 0..6 = 1×..100× *(persisted)* |
+| `--pdgain auto` | photodiode amp gain 10k/100k/1M V/A, or `0`/`1`/`2` fixed *(persisted)* |
 | `--avg 4` | average 4 triggered sweeps before analysis |
 | `--single-channel` | MONITOR OUT not wired to channel B |
 | `--no-controller` | leave the SA201B alone (touchscreen control) |
@@ -159,6 +172,19 @@ in live or single mode.
 corner (or the `d` key) switches between dark and light. Launch with
 `--theme light` to start light. Snapshots save in whichever theme is active.
 
+**Settings are remembered.** On exit the app writes `settings.json`
+(wavelength, theme, ramp amplitude/offset/sweep time/expansion, and the gain
+choice) and restores them next launch. Precedence is
+*explicit command-line flag → saved value → built-in default*, so
+`--wavelength-nm 780` still wins for one session without overwriting your
+saved setup until you exit. Delete `settings.json` to return to defaults.
+
+**If the SA201B's USB drops** mid-session the app keeps measuring (the
+controller keeps ramping on its own), shows
+`! SA201B USB disconnected — retrying...`, and reconnects automatically as
+soon as the port reappears — re-applying amplitude, offset, sweep time,
+expansion, gain and waveform so the session continues unchanged.
+
 **Keys:** `r` run one sweep · `m` live/single mode · `t` alignment mode ·
 `g` cycle PD gain · `a` toggle auto-gain · `e` export data · `d` theme ·
 `←/→` DC offset ±0.25 V · `s` snapshot PNG+CSV · `p` pause display ·
@@ -179,12 +205,21 @@ corner (or the `d` key) switches between dark and light. Launch with
 | File | Role |
 |---|---|
 | `linewidth_live.py` | main live application |
-| `analysis.py` | peak finding, FSR calibration, Lorentzian fit |
+| `analysis.py` | peak finding, FSR calibration, Lorentzian fit, uncertainty |
 | `sa201b.py` | SA201B USB-serial driver (verified protocol) |
 | `pico5000a.py` | PicoScope 5000D block-mode acquisition |
+| `capture.py` | the one-sweep data container shared by both |
 | `simulator.py` | synthetic source used only by the self-test |
 | `test_analysis.py` | pipeline self-test against the simulator |
-| `config.py` | FSR, resolution, ports, palette |
+| `config.py` | FSR, resolution, ports, color themes |
+
+## Tests
+
+`python test_analysis.py` runs the measurement pipeline against a synthetic
+multi-mode laser and asserts it recovers the known linewidth, FSR spacing,
+mode count, fit uncertainty and unit conversions. It needs **no hardware and
+no instrument drivers** (numpy + scipy only), so it runs in CI on every push
+— see [`.github/workflows/tests.yml`](.github/workflows/tests.yml).
 
 ## Requirements
 

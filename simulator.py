@@ -13,7 +13,7 @@ import time
 import numpy as np
 
 import config
-from pico5000a import Capture
+from capture import Capture
 
 _RNG = np.random.default_rng()
 
