@@ -193,3 +193,7 @@ Python 3.12 with `numpy scipy matplotlib pyserial picosdk`
 (provides `ps5000a.dll`; installed at `C:\Program Files\Pico Technology\SDK`).
 Close the PicoScope 7 desktop app before running — only one program can own
 the scope at a time.
+
+## License
+
+[MIT](LICENSE)
