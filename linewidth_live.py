@@ -78,6 +78,13 @@ def resolve_args(args) -> None:
             args.pdgain = "auto"
         else:
             args.pdgain = str(int(saved.get("gain_idx", 0)))
+    mode = saved.get("span_mode", "auto")
+    args.span_mode = mode if mode in ("auto", "full", "manual") else "auto"
+    span = saved.get("span_manual")
+    try:
+        args.span_manual = (float(span[0]), float(span[1]))
+    except Exception:
+        args.span_manual = (-1000.0, 1000.0)
 
 
 def _is_ctrl_error(exc) -> bool:
@@ -386,6 +393,11 @@ class LiveApp:
         self._box_guard = False
         self._manual_gain_idx = 0 if args.pdgain == "auto" else int(args.pdgain)
         self.align_mode = False
+        # graph 2 x-range: "auto" (fit-driven), "full" (one whole FSR), or
+        # "manual" (user min/max, clamped to +-FSR/2)
+        self.zoom_span_mode = getattr(args, "span_mode", None) or "auto"
+        self.zoom_span_manual = tuple(getattr(args, "span_manual", None)
+                                      or (-1000.0, 1000.0))
         self.scan_amplitude = float(args.amplitude)
         self.scan_offset = float(args.offset)
         span_ms = (config.RISETIME_MAX_S - config.RISETIME_MIN_S) * 1e3
@@ -547,8 +559,8 @@ class LiveApp:
             for spine in wax.spines.values():
                 spine.set_color(config.COL_AXIS)
 
-        def _make_box(x, y, w, label, initial, callback):
-            bax = self.fig.add_axes([x, y, w, 0.042])
+        def _make_box(x, y, w, label, initial, callback, h=0.042):
+            bax = self.fig.add_axes([x, y, w, h])
             box = _PatchedTextBox(bax, label, initial=initial,
                                   color=config.COL_SURFACE,
                                   hovercolor="#edece6")
@@ -632,6 +644,28 @@ class LiveApp:
             b.on_clicked(lambda _e, a=ax: self._reset_view(a))
             self._reset_buttons[id(ax)] = b
 
+        # graph 2 x-range controls, on the same row as its reset button
+        zpos = self.ax_zoom.get_position()
+        zy = zpos.y1 + 0.007
+        half = self.fsr_hz / 2e6
+        self.txt_span_label = self.fig.text(
+            0.283, zy + 0.019,
+            f"x-range (MHz, −{half:g}…{half:g}):", fontsize=7.5,
+            color=config.COL_MUTED, va="center")
+        self.SPAN_LABELS = ["Auto", f"Full {self.args.fsr_ghz:g} GHz",
+                            "Manual"]
+        self.combo_span = self._add_combo(0.400, zy, 0.085, self.SPAN_LABELS,
+                                          self._on_span_combo)
+        self.box_span_min = _make_box(0.507, zy, 0.038, "min ",
+                                      f"{self.zoom_span_manual[0]:g}",
+                                      self._on_span_min, h=0.026)
+        self.box_span_max = _make_box(0.567, zy, 0.038, "max ",
+                                      f"{self.zoom_span_manual[1]:g}",
+                                      self._on_span_max, h=0.026)
+        for b in (self.box_span_min, self.box_span_max):
+            b.label.set_fontsize(7.5)
+            b.text_disp.set_fontsize(8)
+
         for evt, cb in (("button_press_event", self._on_zoom_press),
                         ("motion_notify_event", self._on_zoom_motion),
                         ("button_release_event", self._on_zoom_release)):
@@ -640,6 +674,7 @@ class LiveApp:
         self._sync_mode_button()
         self._sync_gain_combo()
         self._sync_expand_combo()
+        self._sync_span_widgets()
         self.txt_keys = self.fig.text(
             x0, 0.045,
             "r run · m mode · t align · g gain · a auto\n"
@@ -667,7 +702,8 @@ class LiveApp:
                                self.btn_align, self.btn_theme,
                                *self._reset_buttons.values()]
         self._theme_boxes = [self.box_wavelength, self.box_amplitude,
-                             self.box_offset, self.box_sweep]
+                             self.box_offset, self.box_sweep,
+                             self.box_span_min, self.box_span_max]
         self._widget_axes = [w.ax for w in
                              (*self._theme_buttons, *self._theme_boxes)]
         self._bg = None
@@ -857,6 +893,7 @@ class LiveApp:
         self.txt_keys.set_color(T["MUTED"])
         self.txt_gain_label.set_color(T["INK2"])
         self.txt_expand_label.set_color(T["MUTED"])
+        self.txt_span_label.set_color(T["MUTED"])
         for b in self._theme_buttons:
             b.color = T["SURFACE"]
             b.hovercolor = T["HOVER"]
@@ -964,8 +1001,7 @@ class LiveApp:
 
     def _typing(self) -> bool:
         return any(getattr(b, "capturekeystrokes", False)
-                   for b in (self.box_wavelength, self.box_amplitude,
-                             self.box_offset, self.box_sweep))
+                   for b in self._theme_boxes)
 
     def _on_wavelength(self, text):
         if self._box_guard:
@@ -980,6 +1016,53 @@ class LiveApp:
             self.txt_status.set_text(
                 f"bad wavelength {text!r} — keeping {self.wavelength_nm:g} nm")
         self._norm_box(self.box_wavelength, f"{self.wavelength_nm:g}")
+
+    # ------------------------------------------------- graph 2 x-range
+    def _sync_span_widgets(self):
+        idx = {"auto": 0, "full": 1, "manual": 2}[self.zoom_span_mode]
+        self.combo_span.set(self.SPAN_LABELS[idx])
+        self._norm_box(self.box_span_min, f"{self.zoom_span_manual[0]:g}")
+        self._norm_box(self.box_span_max, f"{self.zoom_span_manual[1]:g}")
+
+    def _apply_span_mode(self, mode):
+        self.zoom_span_mode = mode
+        # an explicit x-range choice supersedes any drag-zoom on that graph
+        self._user_zoom[(id(self.ax_zoom), "x")] = False
+        self._sync_span_widgets()
+        self._sync_reset_buttons()
+        self._bg = None
+        self.fig.canvas.draw_idle()
+
+    def _on_span_combo(self, label):
+        mode = ("auto", "full", "manual")[self.SPAN_LABELS.index(label)]
+        self._apply_span_mode(mode)
+        print(f"[graph2] x-range mode: {mode}")
+
+    def _on_span_min(self, text):
+        self._set_span_edge(text, "min")
+
+    def _on_span_max(self, text):
+        self._set_span_edge(text, "max")
+
+    def _set_span_edge(self, text, which):
+        if self._box_guard:
+            return
+        half = self.fsr_hz / 2e6
+        lo, hi = self.zoom_span_manual
+        try:
+            v = float(str(text).strip())
+            if not (-half <= v <= half):
+                raise ValueError(f"valid range -{half:g} to {half:g} MHz")
+            lo, hi = (v, hi) if which == "min" else (lo, v)
+            if hi - lo < 1.0:
+                raise ValueError("max must exceed min by at least 1 MHz")
+            self.zoom_span_manual = (lo, hi)
+            print(f"[graph2] x-range {lo:g} .. {hi:g} MHz (manual)")
+            self._apply_span_mode("manual")     # typing implies manual
+            return
+        except Exception as exc:
+            self.txt_status.set_text(f"x-range not set: {exc}")
+        self._sync_span_widgets()
 
     # --------------------------------------------------------- scan controls
     def _push_window(self):
@@ -1282,6 +1365,8 @@ class LiveApp:
             "expand_idx": self.scan_expand_idx,
             "gain_auto": bool(self.auto_gain),
             "gain_idx": int(self._manual_gain_idx),
+            "span_mode": self.zoom_span_mode,
+            "span_manual": list(self.zoom_span_manual),
         }
         try:
             with open(SETTINGS_PATH, "w", encoding="utf-8") as fh:
@@ -1466,16 +1551,24 @@ class LiveApp:
         # ---- zoom panel
         if res.ok and res.hz_per_s and res.fit_center_s is not None:
             f_off = (t - res.fit_center_s) * res.hz_per_s / 1e6
-            biggest_mode = max((abs(m) for m in res.mode_offsets_hz),
-                               default=0.0) / 1e6
-            lw_mhz = res.linewidth_hz / 1e6
-            span = float(np.clip(max(12 * lw_mhz, 1.3 * biggest_mode + 300),
-                                 250, 0.45 * self.fsr_hz / 1e6))
-            for q in (250.0, 500.0, 1000.0, 2000.0, 4500.0):
-                if span <= q:        # quantize so the limits rarely move
-                    span = q
-                    break
-            sel = np.abs(f_off) <= span
+            half_fsr = self.fsr_hz / 2e6
+            if self.zoom_span_mode == "full":
+                xlo, xhi = -half_fsr, half_fsr
+            elif self.zoom_span_mode == "manual":
+                xlo, xhi = self.zoom_span_manual
+            else:
+                biggest_mode = max((abs(m) for m in res.mode_offsets_hz),
+                                   default=0.0) / 1e6
+                lw_mhz = res.linewidth_hz / 1e6
+                span = float(np.clip(
+                    max(12 * lw_mhz, 1.3 * biggest_mode + 300),
+                    250, 0.45 * self.fsr_hz / 1e6))
+                for q in (250.0, 500.0, 1000.0, 2000.0, 4500.0):
+                    if span <= q:    # quantize so the limits rarely move
+                        span = q
+                        break
+                xlo, xhi = -span, span
+            sel = (f_off >= xlo) & (f_off <= xhi)
             zx, zy = _decimate_envelope(f_off[sel], v[sel])
             self.ln_zoom.set_data(zx, zy)
             if res.fit_t is not None:
@@ -1484,7 +1577,7 @@ class LiveApp:
                     res.fit_v)
             else:
                 self.ln_fit.set_data([], [])
-            changed |= self._lim(self.ax_zoom, "x", -span, span, exact=True)
+            changed |= self._lim(self.ax_zoom, "x", xlo, xhi, exact=True)
             ztop = max(0.2, float(np.max(v[sel])) * 1.2) if sel.any() else 1.0
             changed |= self._lim(self.ax_zoom, "y", -0.04 * ztop, ztop)
 

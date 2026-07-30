@@ -168,6 +168,22 @@ with a `#` metadata header: λ, FSR, calibration, FWHM in MHz and pm, finesse,
 gain) and `history_*.csv` (the linewidth-vs-time trend in MHz and pm). Works
 in live or single mode.
 
+**Graph 2 x-range.** Above the "Main peak" graph is an **x-range** control
+with three modes:
+
+* **Auto** (default) — the window follows the fitted linewidth and any
+  neighbouring modes, as it always has.
+* **Full 10 GHz** — forces the whole free spectral range (−5000…+5000 MHz),
+  so you see every mode in one order at once. Useful for spotting the
+  half-FSR higher-order transverse modes that indicate imperfect alignment.
+  The label follows `--fsr-ghz` if your cavity differs.
+* **Manual** — type a **min** and **max** in MHz (clamped to ±FSR/2, i.e.
+  ±5000 MHz for the SA210). Typing in either box switches to Manual
+  automatically; bad or inverted entries are rejected with a message.
+
+The choice is remembered between sessions. A drag-zoom on that graph
+temporarily overrides the mode; **reset view** returns to it.
+
 **Zoom:** drag with the left mouse button anywhere on a graph to zoom into
 that box — this works **while data is streaming**. Auto-scaling for that
 graph pauses so your view stays put, and its **reset view** button (above the
