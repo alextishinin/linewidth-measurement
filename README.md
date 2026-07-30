@@ -168,6 +168,15 @@ with a `#` metadata header: λ, FSR, calibration, FWHM in MHz and pm, finesse,
 gain) and `history_*.csv` (the linewidth-vs-time trend in MHz and pm). Works
 in live or single mode.
 
+**Zoom:** drag with the left mouse button anywhere on a graph to zoom into
+that box — this works **while data is streaming**. Auto-scaling for that
+graph pauses so your view stays put, and its **reset view** button (above the
+graph's top-right corner) lights up; press it to zoom back out and resume
+auto-scaling. A wide, flat drag zooms only the x-axis and leaves y
+auto-scaling — and vice versa — so you can rescale one dimension at a time.
+Small drags (< 8 px) are treated as clicks and ignored. The `v` key resets
+all three graphs at once.
+
 **Theme:** the app starts in **dark mode**; the button in the top-right
 corner (or the `d` key) switches between dark and light. Launch with
 `--theme light` to start light. Snapshots save in whichever theme is active.
@@ -187,8 +196,9 @@ expansion, gain and waveform so the session continues unchanged.
 
 **Keys:** `r` run one sweep · `m` live/single mode · `t` alignment mode ·
 `g` cycle PD gain · `a` toggle auto-gain · `e` export data · `d` theme ·
-`←/→` DC offset ±0.25 V · `s` snapshot PNG+CSV · `p` pause display ·
-`q` quit. (Keys are ignored while typing in any input box.)
+`v` reset all zoomed views · `←/→` DC offset ±0.25 V · `s` snapshot PNG+CSV ·
+`p` pause display · `q` quit. (Keys are ignored while typing in any input
+box.)
 
 ## Interpreting the display
 

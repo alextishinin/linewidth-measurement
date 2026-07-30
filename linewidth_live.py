@@ -4,10 +4,14 @@ Chain: laser -> SA210 Fabry-Perot -> SA201B controller -> PicoScope 5242D -> her
 
 Run:  python linewidth_live.py   (or run.bat)
 
+Drag with the left mouse button on any graph to zoom into that region
+(auto-scaling pauses for that graph until you press its "reset view" button).
+
 Keys in the plot window (ignored while typing in the wavelength box):
   r  run one sweep (single mode)      m  toggle live/single mode
   g  cycle PD amplifier gain          a  toggle auto-gain
   e  export displayed data to CSV    s  snapshot (PNG + raw CSV)
+  d  dark/light theme                v  reset all zoomed views
   left/right  nudge DC offset        p  pause display   q  quit
 """
 from __future__ import annotations
@@ -500,6 +504,22 @@ class LiveApp:
             [], [], color=config.COL_SERIES1, lw=1.4, marker="o", ms=2.5,
             markerfacecolor=config.COL_SERIES1)
 
+        # --- drag-to-zoom state (works while data keeps streaming) ---------
+        from matplotlib.patches import Rectangle
+        self._zoom_axes = (self.ax_sweep, self.ax_zoom, self.ax_trend)
+        # per axis AND per dimension, so a wide flat drag zooms x only
+        self._user_zoom = {(id(a), d): False
+                           for a in self._zoom_axes for d in ("x", "y")}
+        self._auto_lims = {}       # what auto-scaling wants, for "reset view"
+        self._drag = None
+        self._zoom_rect = {}
+        for ax in self._zoom_axes:
+            rect = Rectangle((0, 0), 0, 0, visible=False, animated=True,
+                             facecolor=config.COL_SERIES1, alpha=0.20,
+                             edgecolor=config.COL_SERIES1, lw=1.0, zorder=5)
+            ax.add_patch(rect)
+            self._zoom_rect[id(ax)] = rect
+
         x0 = 0.725
         self.txt_head = self.fig.text(x0, 0.90, "—", fontsize=26,
                                       color=config.COL_INK, fontweight="bold")
@@ -599,13 +619,32 @@ class LiveApp:
         _style(self.btn_theme, ax_theme)
         self.btn_theme.on_clicked(self._on_toggle_theme)
 
+        # one "reset view" button per graph, tucked above its top-right corner
+        self._reset_buttons = {}
+        for ax in self._zoom_axes:
+            pos = ax.get_position()
+            bax = self.fig.add_axes([pos.x1 - 0.068, pos.y1 + 0.007,
+                                     0.068, 0.026])
+            b = Button(bax, "reset view", color=config.COL_SURFACE,
+                       hovercolor="#edece6")
+            _style(b, bax)
+            b.label.set_fontsize(7.5)
+            b.on_clicked(lambda _e, a=ax: self._reset_view(a))
+            self._reset_buttons[id(ax)] = b
+
+        for evt, cb in (("button_press_event", self._on_zoom_press),
+                        ("motion_notify_event", self._on_zoom_motion),
+                        ("button_release_event", self._on_zoom_release)):
+            self.fig.canvas.mpl_connect(evt, cb)
+
         self._sync_mode_button()
         self._sync_gain_combo()
         self._sync_expand_combo()
         self.txt_keys = self.fig.text(
             x0, 0.045,
             "r run · m mode · t align · g gain · a auto\n"
-            "e export · s snap · d theme · p pause · q quit",
+            "e export · s snap · d theme · v reset views\n"
+            "p pause · q quit   ·   drag on a graph to zoom",
             fontsize=8, color=config.COL_MUTED, va="top")
         self.fig.canvas.mpl_connect("key_press_event", self._on_key)
         if self.mode == "single":
@@ -617,14 +656,16 @@ class LiveApp:
         # cached background; a full draw happens only when axis limits move.
         self._animated = [self.ln_sweep, self.mk_peaks, self.ln_zoom,
                           self.ln_fit, self.ln_trend, self.txt_head,
-                          self.txt_sub, self.txt_stats, self.txt_status]
+                          self.txt_sub, self.txt_stats, self.txt_status,
+                          *self._zoom_rect.values()]
         for a in self._animated:
             a.set_animated(True)
         # Widget axes are re-drawn from live state on every blit; otherwise a
         # blit restores the cached background and wipes hover highlights the
         # instant a new sweep is rendered.
         self._theme_buttons = [self.btn_run, self.btn_mode, self.btn_export,
-                               self.btn_align, self.btn_theme]
+                               self.btn_align, self.btn_theme,
+                               *self._reset_buttons.values()]
         self._theme_boxes = [self.box_wavelength, self.box_amplitude,
                              self.box_offset, self.box_sweep]
         self._widget_axes = [w.ax for w in
@@ -645,22 +686,137 @@ class LiveApp:
 
         Hysteresis (grow at once, shrink only when data uses <55% of the
         range) keeps limits — and therefore the cached background — stable.
+        An axis the user has zoomed into is left alone: the target is only
+        recorded, so "reset view" knows where to go back to.
         """
+        key = (id(ax), axis)
         cur = ax.get_xlim() if axis == "x" else ax.get_ylim()
-        if exact:
-            if abs(cur[0] - lo) < 1e-12 and abs(cur[1] - hi) < 1e-12:
-                return False
-        else:
+        if not exact:
             span = hi - lo
             if span <= 0:
                 return False
-            inside = lo >= cur[0] - 1e-12 and hi <= cur[1] + 1e-12
-            fills = span > 0.55 * (cur[1] - cur[0])
-            if inside and fills:
+            lo_pad, hi_pad = lo - 0.1 * span, hi + 0.1 * span
+        else:
+            lo_pad, hi_pad = lo, hi
+
+        if self._user_zoom.get(key):
+            self._auto_lims[key] = (lo_pad, hi_pad)   # remember, don't apply
+            return False
+
+        if exact:
+            if abs(cur[0] - lo) < 1e-12 and abs(cur[1] - hi) < 1e-12:
+                self._auto_lims[key] = cur
                 return False
-            lo, hi = lo - 0.1 * span, hi + 0.1 * span
-        (ax.set_xlim if axis == "x" else ax.set_ylim)(lo, hi)
+        else:
+            inside = lo >= cur[0] - 1e-12 and hi <= cur[1] + 1e-12
+            fills = (hi - lo) > 0.55 * (cur[1] - cur[0])
+            if inside and fills:
+                self._auto_lims[key] = cur
+                return False
+        (ax.set_xlim if axis == "x" else ax.set_ylim)(lo_pad, hi_pad)
+        self._auto_lims[key] = (lo_pad, hi_pad)
         return True
+
+    # ------------------------------------------------------- drag-to-zoom
+    def _toolbar_busy(self) -> bool:
+        tb = getattr(self.fig.canvas, "toolbar", None)
+        return bool(tb is not None and getattr(tb, "mode", ""))
+
+    def _on_zoom_press(self, event):
+        if (event.button != 1 or self._toolbar_busy()
+                or event.inaxes not in self._zoom_axes
+                or event.xdata is None or event.ydata is None):
+            return
+        self._drag = (event.inaxes, event.xdata, event.ydata,
+                      event.x, event.y)
+        rect = self._zoom_rect[id(event.inaxes)]
+        rect.set_bounds(event.xdata, event.ydata, 0, 0)
+        rect.set_visible(True)
+
+    def _on_zoom_motion(self, event):
+        if self._drag is None:
+            return
+        ax, x0, y0, _px, _py = self._drag
+        if event.xdata is None or event.ydata is None:
+            return          # cursor left the axes; keep the last rectangle
+        rect = self._zoom_rect[id(ax)]
+        rect.set_bounds(min(x0, event.xdata), min(y0, event.ydata),
+                        abs(event.xdata - x0), abs(event.ydata - y0))
+        self._blit()        # live rubber band, independent of the data timer
+
+    def _on_zoom_release(self, event):
+        if self._drag is None:
+            return
+        ax, x0, y0, px, py = self._drag
+        self._drag = None
+        self._zoom_rect[id(ax)].set_visible(False)
+        x1 = x0 if event.xdata is None else event.xdata
+        y1 = y0 if event.ydata is None else event.ydata
+        dx_px = abs((event.x if event.x is not None else px) - px)
+        dy_px = abs((event.y if event.y is not None else py) - py)
+
+        # A drag that is wide but flat zooms x only, and vice versa, so you
+        # can rescale one dimension without disturbing the other.
+        MIN_PX = 8
+        zoomed = False
+        if dx_px >= MIN_PX and x1 != x0:
+            ax.set_xlim(min(x0, x1), max(x0, x1))
+            self._user_zoom[(id(ax), "x")] = True
+            zoomed = True
+        if dy_px >= MIN_PX and y1 != y0:
+            ax.set_ylim(min(y0, y1), max(y0, y1))
+            self._user_zoom[(id(ax), "y")] = True
+            zoomed = True
+        if zoomed:
+            print(f"[zoom] {ax.get_title(loc='left') or 'graph'}: "
+                  f"zoomed — auto-scaling paused until reset")
+        self._sync_reset_buttons()
+        self._bg = None                 # ticks changed: rebuild background
+        self.fig.canvas.draw_idle()
+
+    def _reset_view(self, ax, redraw=True):
+        for d in ("x", "y"):
+            key = (id(ax), d)
+            if self._user_zoom.get(key):
+                self._user_zoom[key] = False
+                lims = self._auto_lims.get(key)
+                if lims:
+                    (ax.set_xlim if d == "x" else ax.set_ylim)(*lims)
+        self._sync_reset_buttons()
+        if redraw:
+            self._bg = None
+            self.fig.canvas.draw_idle()
+
+    def _reset_all_views(self):
+        for ax in self._zoom_axes:
+            self._reset_view(ax, redraw=False)
+        self._bg = None
+        self.fig.canvas.draw_idle()
+
+    def _sync_reset_buttons(self):
+        """Highlight the reset button of every graph that is zoomed."""
+        T = config.THEMES[self.theme_name]
+        for ax in self._zoom_axes:
+            active = any(self._user_zoom.get((id(ax), d))
+                         for d in ("x", "y"))
+            b = self._reset_buttons[id(ax)]
+            face = T["HOVER"] if active else T["SURFACE"]
+            b.color = face
+            b.ax.set_facecolor(face)
+            b.label.set_color(T["INK"] if active else T["MUTED"])
+
+    def _blit(self):
+        """Repaint the dynamic artists over the cached background."""
+        canvas = self.fig.canvas
+        if self._bg is None:
+            canvas.draw()
+            return
+        canvas.restore_region(self._bg)
+        for a in self._animated:
+            self.fig.draw_artist(a)
+        for wax in self._widget_axes:
+            self.fig.draw_artist(wax)
+        canvas.blit(self.fig.bbox)
 
     # ---------------------------------------------------------------- theme
     def _on_toggle_theme(self, _event=None):
@@ -708,6 +864,10 @@ class LiveApp:
             b.label.set_color(T["INK"])
             for spine in b.ax.spines.values():
                 spine.set_color(T["AXIS"])
+        for rect in self._zoom_rect.values():
+            rect.set_facecolor(T["SERIES1"])
+            rect.set_edgecolor(T["SERIES1"])
+        self._sync_reset_buttons()
         for box in self._theme_boxes:
             box.color = T["SURFACE"]
             box.hovercolor = T["HOVER"]
@@ -1049,6 +1209,8 @@ class LiveApp:
             self._on_toggle_align()
         elif event.key == "d":
             self._on_toggle_theme()
+        elif event.key == "v":
+            self._reset_all_views()
         elif event.key == "s":
             self._snapshot()
         elif event.key == "e":
@@ -1433,16 +1595,10 @@ class LiveApp:
 
         # ---- render: blit the dynamic artists; full draw only when the
         # axis furniture (limits/ticks) actually changed
-        canvas = self.fig.canvas
         if changed or self._bg is None:
-            canvas.draw()                # _on_draw refreshes the background
+            self.fig.canvas.draw()       # _on_draw refreshes the background
         else:
-            canvas.restore_region(self._bg)
-            for a in self._animated:
-                self.fig.draw_artist(a)
-            for wax in self._widget_axes:    # keep hover highlights alive
-                self.fig.draw_artist(wax)
-            canvas.blit(self.fig.bbox)
+            self._blit()
 
     # ------------------------------------------------------------------ run
     def run(self):
