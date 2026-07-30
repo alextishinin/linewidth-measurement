@@ -41,9 +41,20 @@ length. Each time the cavity comes into resonance with the laser, a
 transmission peak appears on the photodiode. The same laser line repeats every
 free spectral range, so the time between two repeats equals exactly **10 GHz**
 — that calibrates the time axis into optical frequency with no assumptions
-about wavelength, piezo gain, or ramp slope. The program then fits a
-Lorentzian to the tallest peak; its FWHM in calibrated units is the measured
-linewidth.
+about wavelength or ramp slope. The program then fits a Lorentzian to the
+tallest peak; its FWHM in calibrated units is the measured linewidth.
+
+Finding that repeat spacing is less trivial than it sounds: the piezo's
+nonlinearity chirps the peak spacing across the sweep, and a misaligned
+confocal cavity adds **odd transverse modes exactly halfway between the
+fundamentals** (a comb at FSR/2 that can look identical to the real one).
+The calibration therefore builds candidate periods from tall-peak spacings
+and autocorrelation, rejects any that imply a finesse beyond ~1.5× the
+instrument spec (an impossibly *good* answer means the ruler is wrong),
+requires an actual partner peak one period away, and picks among the
+survivors using the piezo's nominal ~10 V/FSR as a soft prior. The spacing
+is then measured as the average of the left and right neighbour gaps, which
+cancels the chirp to first order at the analyzed peak.
 
 **Resolution floor:** the measured width is the laser lineshape *convolved*
 with the instrument function (~67 MHz). A laser much narrower than 67 MHz
@@ -154,6 +165,15 @@ recommended waveform for initial cavity alignment — and the headline changes
 from linewidth to **peak height in volts**: walk the mirror mount to maximize
 that number. Alignment sweeps are excluded from the history plot and CSV log.
 Click again to return to sawtooth measurement mode.
+
+**Transverse-mode meter.** The stats panel shows
+`transverse modes: N% of main (alignment good/fair/poor)` — the height of the
+strongest peak found at half-FSR positions relative to the fundamental. Those
+peaks are the confocal cavity's odd transverse modes, excited by imperfect
+mode matching; they are excluded from the longitudinal-mode count and, above
+50%, trigger an alignment warning. Minimizing this number (tip/tilt, iris,
+focus position) *is* the alignment procedure — in Align mode the subtitle
+shows it live next to the peak height.
 
 **PD gain (V/A) dropdown:** *Auto* (the default) adjusts the SA201B
 photodiode amplifier both ways — it steps the gain *down* when the 5 V output

@@ -58,6 +58,10 @@ class SweepAnalysis:
     deconvolved_hz: float | None = None
     finesse: float | None = None
     mode_offsets_hz: list[float] = field(default_factory=list)
+    # transverse-mode contamination: height of the strongest peak found at
+    # half-FSR positions relative to the main peak (0 = clean TEM00,
+    # ~1 = as tall as the fundamental). None when it cannot be assessed.
+    transverse_frac: float | None = None
     # health flags
     saturating: bool = False
     weak: bool = False
@@ -100,6 +104,17 @@ def _parabolic_apex(t, v, i):
         return t[i]
     shift = 0.5 * (v[i - 1] - v[i + 1]) / denom
     return t[i] + np.clip(shift, -1.0, 1.0) * (t[1] - t[0])
+
+
+def _nearest_peak(apex_t, heights, t_target, tol):
+    """(time, height) of the detected peak nearest t_target within tol."""
+    best = None
+    best_d = tol
+    for tt, hh in zip(apex_t, heights):
+        d = abs(tt - t_target)
+        if d <= best_d:
+            best, best_d = (float(tt), float(hh)), d
+    return best
 
 
 def _direct_fwhm(t, v, i_peak, baseline):
@@ -147,7 +162,8 @@ def trim_to_rising_ramp(cap, rise_time_estimate_s: float):
 def analyze_sweep(t: np.ndarray, v: np.ndarray,
                   fsr_hz: float = config.FSR_HZ,
                   instrument_hz: float = config.INSTRUMENT_RES_HZ,
-                  min_signal_v: float = 0.05) -> SweepAnalysis:
+                  min_signal_v: float = 0.05,
+                  expected_fsr_period_s: float | None = None) -> SweepAnalysis:
     out = SweepAnalysis(t=t, v=v)
     n = len(v)
     if n < 500:
@@ -186,40 +202,69 @@ def analyze_sweep(t: np.ndarray, v: np.ndarray,
     i_main = 0
     t_main = apex_t[i_main]
 
-    # ------------------------------------------------- FSR period candidates
-    # np.correlate is O(n^2): keep the decimated trace small. Lag precision
-    # is refined by the same-mode partner peak match afterwards anyway.
+    # ------------------------------------------- FSR period candidate set
+    # Two complementary sources, because each fails somewhere the other
+    # doesn't:
+    #  * spacings between TALL peaks adjacent to the main one -- immune to
+    #    piezo chirp and to weak satellites (longitudinal side modes,
+    #    transverse contamination), but blind to pattern structure;
+    #  * autocorrelation lags -- see the repeating pattern of multimode
+    #    clusters, but chirp smears the long lags.
+    # Every candidate is also entered doubled, so a half-FSR transverse comb
+    # offers its true FSR as a hypothesis.
+    w0_main = widths_s[i_main]
+    main_h = heights[i_main]
+    cand = set()
+
+    tall_t = np.sort(apex_t[heights >= 0.7 * main_h])
+    i_t = int(np.argmin(np.abs(tall_t - t_main)))
+    if i_t > 0:
+        cand.add(float(t_main - tall_t[i_t - 1]))
+    if i_t < len(tall_t) - 1:
+        cand.add(float(tall_t[i_t + 1] - t_main))
+    if 0 < i_t < len(tall_t) - 1:
+        cand.add(float((tall_t[i_t + 1] - tall_t[i_t - 1]) / 2))
+
     dec = max(1, n // 2048)
     x = vv[::dec] - vv[::dec].mean()
     ac = np.correlate(x, x, mode="full")[len(x) - 1:]
     ac /= ac[0] if ac[0] > 0 else 1.0
-    lo = max(int(0.05 * len(x)), 4)
+    lag_step = dec * dt
+    lo = max(4, min(int(3 * w0_main / lag_step), int(0.15 * len(x))))
     hi = int(0.95 * len(x))
-    lag_peaks, lag_props = find_peaks(ac[lo:hi], height=0.10, prominence=0.05)
-    candidates = [((lp + lo) * dec * dt, h)
-                  for lp, h in zip(lag_peaks, lag_props["peak_heights"])]
-    candidates.sort(key=lambda c: -c[1])
+    if hi > lo + 4:
+        lag_peaks, lag_props = find_peaks(ac[lo:hi], height=0.10,
+                                          prominence=0.05)
+        by_score = sorted(zip(lag_props["peak_heights"], lag_peaks),
+                          reverse=True)
+        for _score, lp in by_score[:4]:
+            cand.add(float((lp + lo) * lag_step))
+    for T in list(cand):
+        cand.add(2.0 * T)
 
-    def partner_near(t_target, min_height_frac=0.65):
-        tol = max(0.07 * abs(t_target - t_main), 20 * dt)
+    def _partner(T):
+        tol = max(0.15 * T, 6 * w0_main)
         best = None
-        for tt, hh in zip(apex_t, heights):
-            if abs(tt - t_target) < tol and hh >= min_height_frac * heights[i_main]:
-                if best is None or abs(tt - t_target) < abs(best - t_target):
-                    best = tt
+        for sign in (+1, -1):
+            p = _nearest_peak(apex_t, heights, t_main + sign * T, tol)
+            if p is not None and p[1] >= 0.3 * main_h and \
+                    (best is None or p[1] > best[1]):
+                best = p
         return best
 
-    fsr_period = None
-    for lag_s, _score in candidates[:6]:
-        for sign in (+1, -1):
-            partner = partner_near(t_main + sign * lag_s)
-            if partner is not None:
-                fsr_period = abs(partner - t_main)
-                break
-        if fsr_period:
-            break
-    if fsr_period is None and candidates:
-        fsr_period = candidates[0][0]   # autocorrelation only, unconfirmed
+    def _support(T):
+        """Fraction of tall peaks near the main one explained by comb T."""
+        tol = max(0.15 * T, 6 * w0_main)
+        seen = ok = 0
+        for tt in tall_t:
+            d = abs(tt - t_main)
+            if d < 0.5 * tol or d > 2.2 * T:
+                continue
+            seen += 1
+            k = round(d / T)
+            if k >= 1 and abs(d - k * T) <= tol * k:
+                ok += 1
+        return ok / seen if seen else 0.0
 
     # ------------------------------------------------------ main-peak width
     gap = np.inf
@@ -263,11 +308,54 @@ def analyze_sweep(t: np.ndarray, v: np.ndarray,
         return out
 
     # ---------------------------------------------------------- calibration
-    if fsr_period is None:
+    # Filter the candidates by physics, then select:
+    #   * guard: a period implying finesse far beyond the instrument spec is
+    #     impossible (the ruler is wrong, not the laser), and the FSR must
+    #     comfortably exceed the measured linewidth;
+    #   * a same-comb partner peak must actually exist one period away;
+    #   * the piezo prior (~10 V per FSR on the SA210) picks among the
+    #     survivors -- it is the only thing that can tell a half-FSR comb of
+    #     EQUAL-height transverse modes from the real spacing;
+    #   * without a prior, the candidate explaining the most tall peaks wins
+    #     (ties resolve to the smaller period: over-reading the linewidth is
+    #     safer than inventing resolution).
+    finesse_max = 1.5 * fsr_hz / instrument_hz
+    valid = []
+    for T in sorted(cand):
+        if T <= 0 or T / fwhm_s > finesse_max or T < 2.5 * fwhm_s:
+            continue
+        if _partner(T) is None:
+            continue
+        if valid and T <= 1.05 * valid[-1]:
+            continue                    # merge near-duplicates
+        valid.append(T)
+    if not valid:
         out.message = ("only one FSR visible — raise the SA201B amplitude "
                        "(30 V shows ~3 FSR) so the peak spacing can "
                        "calibrate the axis")
         return out
+    if expected_fsr_period_s:
+        fsr_period = min(valid,
+                         key=lambda T: abs(np.log(T / expected_fsr_period_s)))
+    else:
+        fsr_period = max(valid, key=lambda T: (_support(T), -T))
+
+    # refinement: averaging the left and right neighbour spacing cancels the
+    # linear piezo-chirp term at the analyzed peak
+    tolr = max(0.15 * fsr_period, 6 * w0_main)
+    lft = _nearest_peak(apex_t, heights, t_main - fsr_period, tolr)
+    rgt = _nearest_peak(apex_t, heights, t_main + fsr_period, tolr)
+    if lft is not None and lft[1] < 0.3 * main_h:
+        lft = None
+    if rgt is not None and rgt[1] < 0.3 * main_h:
+        rgt = None
+    if lft is not None and rgt is not None:
+        fsr_period = (rgt[0] - lft[0]) / 2
+    elif lft is not None:
+        fsr_period = t_main - lft[0]
+    elif rgt is not None:
+        fsr_period = rgt[0] - t_main
+
     out.fsr_period_s = float(fsr_period)
     out.hz_per_s = fsr_hz / fsr_period
     out.linewidth_hz = fwhm_s * out.hz_per_s
@@ -276,10 +364,29 @@ def analyze_sweep(t: np.ndarray, v: np.ndarray,
     out.deconvolved_hz = max(out.linewidth_hz - instrument_hz, 0.0)
     out.finesse = fsr_hz / out.linewidth_hz
 
+    # -------------------------------------------- transverse contamination
+    # strongest peak at a half-FSR position, relative to the main peak
+    half_tol = max(0.12 * fsr_period / 2, 6 * w0_main)
+    trans = 0.0
+    for k in (-1.5, -0.5, 0.5, 1.5):
+        p = _nearest_peak(apex_t, heights, t_main + k * fsr_period, half_tol)
+        if p is not None:
+            trans = max(trans, p[1] / main_h)
+    out.transverse_frac = float(trans)
+
     # ------------------------------------------------------- mode structure
+    # peaks at half-FSR positions are cavity transverse modes, not laser
+    # modes -- keep them out of the longitudinal-mode listing
     win_lo, win_hi = t_main - 0.02 * fsr_period, t_main + 0.90 * fsr_period
-    offsets = [(tt - t_main) * out.hz_per_s
-               for tt in apex_t if win_lo <= tt <= win_hi]
+    offsets = []
+    for tt in apex_t:
+        if not (win_lo <= tt <= win_hi):
+            continue
+        frac_pos = (tt - t_main) / fsr_period
+        dist_to_int = abs(frac_pos - round(frac_pos))
+        if trans > 0 and abs(dist_to_int - 0.5) < 0.12:
+            continue        # half-FSR position: transverse, not a laser mode
+        offsets.append((tt - t_main) * out.hz_per_s)
     out.mode_offsets_hz = sorted(offsets)
 
     out.ok = True

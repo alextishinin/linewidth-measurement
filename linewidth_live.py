@@ -437,7 +437,8 @@ class LiveApp:
                 ["unix_time", "iso_time", "linewidth_hz", "linewidth_direct_hz",
                  "deconvolved_hz", "finesse", "fsr_period_s", "hz_per_s",
                  "peak_v", "n_modes", "pd_gain_index", "wavelength_nm",
-                 "linewidth_pm", "linewidth_err_hz", "flags"])
+                 "linewidth_pm", "linewidth_err_hz", "transverse_frac",
+                 "flags"])
         self._build_figure()
 
     def _new_acquirer(self) -> Acquirer:
@@ -1238,6 +1239,8 @@ class LiveApp:
                 fh.write(f"# fwhm_wavelength: {wv:.4g} {wu}\n")
             if res.finesse:
                 fh.write(f"# effective_finesse: {res.finesse:.1f}\n")
+            if res.transverse_frac is not None:
+                fh.write(f"# transverse_frac: {res.transverse_frac:.3f}\n")
             if self.ctrl is not None:
                 fh.write(f"# pd_gain: {self.GAIN_NAMES[self._gain_cache]}\n")
             fh.write(f"# mode: {self.mode}\n")
@@ -1505,6 +1508,8 @@ class LiveApp:
             (f"{ana.delta_lambda_m(res.linewidth_hz, self.wavelength_nm) * 1e12:.6g}"
              if res.linewidth_hz else ""),
             f"{self._last_err_hz:.6g}" if self._last_err_hz else "",
+            (f"{res.transverse_frac:.3f}"
+             if res.transverse_frac is not None else ""),
             flags])
         if int(now) % 5 == 0:
             self._log_file.flush()
@@ -1528,8 +1533,15 @@ class LiveApp:
                 wall).strftime("%H:%M:%S")
 
         t, v, ramp_end = ana.trim_to_rising_ramp(cap, self.acq.rise_s)
+        # nominal piezo calibration (~10 V/FSR) as a soft prior so the FSR
+        # search can tell a half-FSR transverse comb from the real spacing
+        expected_T = None
+        if self.scan_amplitude > 0:
+            expected_T = (self.acq.rise_s * config.VOLTS_PER_FSR
+                          / self.scan_amplitude)
         res = ana.analyze_sweep(t, v, fsr_hz=self.fsr_hz,
-                                instrument_hz=self.instrument_hz)
+                                instrument_hz=self.instrument_hz,
+                                expected_fsr_period_s=expected_T)
         self.last_result = res
         self._auto_gain_step(res)
         self._last_err_hz = self._uncertainty_hz(res)
@@ -1612,8 +1624,11 @@ class LiveApp:
         if self.align_mode:
             peak_v = float(np.max(v)) if len(v) else 0.0
             self.txt_head.set_text(f"{peak_v:.3f} V")
-            self.txt_sub.set_text(
-                "alignment — maximize peak height (triangle scan)")
+            sub = "alignment — maximize peak height (triangle scan)"
+            if res.transverse_frac is not None:
+                sub = (f"alignment — peak height up, transverse "
+                       f"{res.transverse_frac * 100:.0f}% down")
+            self.txt_sub.set_text(sub)
         elif res.ok and res.linewidth_hz:
             err = self._last_err_hz
             head = f"{res.linewidth_hz / 1e6:.1f}"
@@ -1655,6 +1670,12 @@ class LiveApp:
                          f"(spacing {', '.join(f'{s:.0f}' for s in spacings)} MHz)")
         elif res.ok:
             stats.append("modes in one FSR: 1 (single-frequency)")
+        if res.transverse_frac is not None:
+            frac = res.transverse_frac
+            tag = ("good" if frac < 0.05 else
+                   "fair" if frac < 0.20 else "poor")
+            stats.append(f"transverse modes: {frac * 100:.0f}% of main "
+                         f"(alignment {tag})")
         if self.ctrl is not None:
             stats.append(f"PD gain: {self.GAIN_NAMES[self._gain_cache]}"
                          f"{'  [auto]' if self.auto_gain else ''}")
@@ -1680,6 +1701,9 @@ class LiveApp:
             warn.append("! signal saturating — lower PD gain / input power")
         if cap.clipped:
             warn.append("! scope ADC clipped")
+        if res.transverse_frac is not None and res.transverse_frac > 0.5:
+            warn.append("! strong transverse modes — improve alignment "
+                        "(minimize the half-FSR peaks)")
         if self.ctrl is None and not self.args.no_controller:
             warn.append("! SA201B USB disconnected — retrying...")
         if self.acq.status not in ("ok", "starting"):

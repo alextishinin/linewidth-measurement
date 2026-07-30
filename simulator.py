@@ -65,10 +65,14 @@ class SimulatedScope:
 
     FINESSE = 150.0
     MODES = [(0.0, 1.0), (435e6, 0.55), (870e6, 0.18)]  # (offset Hz, rel amp)
-    VOLTS_PER_FSR = 10.0     # SA210 manual: a 0-20 V sawtooth covers ~2 FSR
+    VOLTS_PER_FSR = config.VOLTS_PER_FSR  # SA210 manual: ~10 V per FSR
     PEAK_VOLTS = 3.2         # tallest peak at the photodiode amplifier output
     NOISE_V = 0.004
     SWEEP_NONLINEARITY = 0.03
+    # Odd transverse modes of the confocal cavity: a second comb at exactly
+    # FSR/2, with this relative height (0 = perfect mode matching; ~1 = the
+    # badly aligned case where both combs look identical)
+    TRANSVERSE_FRAC = 0.0
 
     def __init__(self, controller: SimulatedSA201B):
         self.ctrl = controller
@@ -117,6 +121,11 @@ class SimulatedScope:
         for mode_off, amp in self.MODES:
             nu = freq - offset - mode_off
             pd += amp / (1.0 + coeff * np.sin(np.pi * nu / config.FSR_HZ) ** 2)
+            if self.TRANSVERSE_FRAC > 0:
+                nu_t = nu - config.FSR_HZ / 2
+                pd += (amp * self.TRANSVERSE_FRAC /
+                       (1.0 + coeff * np.sin(np.pi * nu_t /
+                                             config.FSR_HZ) ** 2))
         pd *= self.PEAK_VOLTS
         gain_scale = {0: 1.0, 1: 10.0, 2: 100.0}[self.ctrl.pd_gain_index]
         pd = np.clip(pd * gain_scale, 0.0, 5.0)
