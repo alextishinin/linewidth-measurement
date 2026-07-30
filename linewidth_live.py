@@ -22,6 +22,7 @@ import csv
 import datetime as _dt
 import json
 import os
+import queue
 import sys
 import threading
 import time
@@ -267,7 +268,8 @@ class Acquirer(threading.Thread):
                 abort()
             except Exception:
                 pass
-        self.join(timeout=timeout_s)
+        if self.is_alive():          # join() raises if never started
+            self.join(timeout=timeout_s)
         try:
             self.scope.close()      # idempotent; no-op if the thread got it
         except Exception:
@@ -412,6 +414,11 @@ class LiveApp:
         self._ctrl_retry_at = 0.0
         self._ctrl_reconnecting = False
         self._ctrl_restored = False
+        # controller writes take ~0.5 s over serial (set + verify); they run
+        # on this worker so button clicks and text boxes respond instantly
+        self._ctrl_q = queue.Queue()
+        self._ctrl_err = None            # (message, monotonic time)
+        threading.Thread(target=self._ctrl_worker, daemon=True).start()
         self._fsr_hist = collections.deque(maxlen=20)
         self._last_err_hz = None
         self._gain_cooldown_until = 0.0
@@ -1082,16 +1089,11 @@ class LiveApp:
             v = float(str(text).strip())
             if not (1.0 <= v <= 30.0):
                 raise ValueError("valid range 1-30 V")
-            if self.ctrl is not None:
-                self.ctrl.amplitude_v = v
-            else:
-                self._no_ctrl_hint()
             self.scan_amplitude = v
-            print(f"[scan] amplitude -> {v:g} V")
-        except Exception as exc:
+            self._ctrl_do(f"amplitude -> {v:g} V",
+                          lambda c: setattr(c, "amplitude_v", v))
+        except ValueError as exc:
             self.txt_status.set_text(f"amplitude not set: {exc}")
-            if _is_ctrl_error(exc):
-                self._note_ctrl_failure(exc)
         self._norm_box(self.box_amplitude, f"{self.scan_amplitude:g}")
 
     def _on_offset_box(self, text):
@@ -1101,16 +1103,11 @@ class LiveApp:
             v = float(str(text).strip())
             if not (0.0 <= v <= 15.0):
                 raise ValueError("valid range 0-15 V")
-            if self.ctrl is not None:
-                self.ctrl.dc_offset_v = v
-            else:
-                self._no_ctrl_hint()
             self.scan_offset = v
-            print(f"[scan] DC offset -> {v:g} V")
-        except Exception as exc:
+            self._ctrl_do(f"DC offset -> {v:g} V",
+                          lambda c: setattr(c, "dc_offset_v", v))
+        except ValueError as exc:
             self.txt_status.set_text(f"offset not set: {exc}")
-            if _is_ctrl_error(exc):
-                self._note_ctrl_failure(exc)
         self._norm_box(self.box_offset, f"{self.scan_offset:g}")
 
     def _on_sweep_box(self, text):
@@ -1122,39 +1119,25 @@ class LiveApp:
             ms = float(str(text).strip())
             if not (lo <= ms <= hi):
                 raise ValueError(f"valid range {lo:g}-{hi:g} ms (at 1x)")
-            step = int(round((ms - lo) / (hi - lo) * config.RISETIME_STEPS))
-            step = max(0, min(config.RISETIME_STEPS, step))
-            if self.ctrl is not None:
-                self.ctrl.risetime_step = step
-            else:
-                self._no_ctrl_hint()
+            step = _ms_to_step(ms)
             self.scan_sweep_ms = lo + step / config.RISETIME_STEPS * (hi - lo)
             self._push_window()
-            print(f"[scan] sweep -> {self.scan_sweep_ms:g} ms at 1x "
-                  f"(step {step})")
-        except Exception as exc:
+            self._ctrl_do(f"sweep -> {self.scan_sweep_ms:g} ms at 1x "
+                          f"(step {step})",
+                          lambda c: setattr(c, "risetime_step", step))
+        except ValueError as exc:
             self.txt_status.set_text(f"sweep time not set: {exc}")
-            if _is_ctrl_error(exc):
-                self._note_ctrl_failure(exc)
         self._norm_box(self.box_sweep, f"{self.scan_sweep_ms:g}")
 
     def _sync_expand_combo(self):
         self.combo_expand.set(self.EXPAND_LABELS[self.scan_expand_idx])
 
     def _set_expand(self, idx):
-        try:
-            if self.ctrl is not None:
-                self.ctrl.sweep_expand_index = idx
-            else:
-                self._no_ctrl_hint()
-            self.scan_expand_idx = idx
-            self._push_window()
-            print(f"[scan] sweep expansion -> "
-                  f"{config.SWEEP_EXPANSION_FACTORS[idx]}x")
-        except Exception as exc:
-            self.txt_status.set_text(f"expansion not set: {exc}")
-            if _is_ctrl_error(exc):
-                self._note_ctrl_failure(exc)
+        self.scan_expand_idx = idx
+        self._push_window()
+        self._ctrl_do(
+            f"sweep expansion -> {config.SWEEP_EXPANSION_FACTORS[idx]}x",
+            lambda c: setattr(c, "sweep_expand_index", idx))
         self._sync_expand_combo()
 
     def _on_expand_combo(self, label):
@@ -1163,16 +1146,10 @@ class LiveApp:
     # ------------------------------------------------------- alignment mode
     def _on_toggle_align(self, _event=None):
         self.align_mode = not self.align_mode
-        if self.ctrl is not None:
-            try:
-                self.ctrl.sawtooth = not self.align_mode
-                print(f"[align] {'triangle scan (alignment)' if self.align_mode else 'sawtooth scan (measurement)'}")
-            except Exception as exc:
-                self.txt_status.set_text(f"waveform switch failed: {exc}")
-                if _is_ctrl_error(exc):
-                    self._note_ctrl_failure(exc)
-        else:
-            self._no_ctrl_hint()
+        want_saw = not self.align_mode
+        self._ctrl_do("triangle scan (alignment)" if self.align_mode
+                      else "sawtooth scan (measurement)",
+                      lambda c: setattr(c, "sawtooth", want_saw))
         self.btn_align.label.set_text(
             "Align: TRI" if self.align_mode else "Align: off")
         self.fig.canvas.draw_idle()
@@ -1183,23 +1160,17 @@ class LiveApp:
         if self.ctrl is None:
             self.txt_status.set_text(
                 "SA201B USB not connected — gain control unavailable")
+        elif idx == 0:
+            self.auto_gain = True
+            self._gain_cooldown_until = 0.0
+            print("[gain] auto-gain ON")
         else:
-            try:
-                if idx == 0:
-                    self.auto_gain = True
-                    self._gain_cooldown_until = 0.0
-                    print("[gain] auto-gain ON")
-                else:
-                    self.ctrl.pd_gain_index = idx - 1
-                    self._gain_cache = idx - 1
-                    self._manual_gain_idx = idx - 1
-                    self.auto_gain = False
-                    print(f"[gain] manual -> {self.GAIN_NAMES[idx - 1]}")
-            except Exception as exc:
-                print(f"[gain] failed: {exc}")
-                self.txt_status.set_text(f"gain set failed: {exc}")
-                if _is_ctrl_error(exc):
-                    self._note_ctrl_failure(exc)
+            g = idx - 1
+            self._gain_cache = g
+            self._manual_gain_idx = g
+            self.auto_gain = False
+            self._ctrl_do(f"manual gain -> {self.GAIN_NAMES[g]}",
+                          lambda c: setattr(c, "pd_gain_index", g))
         self._sync_gain_combo()
 
     def _on_gain_combo(self, label):
@@ -1309,30 +1280,14 @@ class LiveApp:
                 print(f"[gain] auto-gain {'ON' if self.auto_gain else 'OFF'}")
                 self._sync_gain_combo()
         elif event.key == "g" and self.ctrl is not None:
-            try:
-                g = (self._gain_cache + 1) % 3
-                self.ctrl.pd_gain_index = g
-                self._gain_cache = g
-                self._manual_gain_idx = g
-                self.auto_gain = False
-                print(f"[gain] manual -> {self.GAIN_NAMES[g]} (auto-gain off)")
-            except Exception as exc:
-                print(f"[gain] failed: {exc}")
-                if _is_ctrl_error(exc):
-                    self._note_ctrl_failure(exc)
-            self._sync_gain_combo()
+            self._apply_gain_choice(((self._gain_cache + 1) % 3) + 1)
         elif event.key in ("left", "right") and self.ctrl is not None:
-            try:
-                delta = 0.25 if event.key == "right" else -0.25
-                new = float(np.clip(self.scan_offset + delta, 0.0, 15.0))
-                self.ctrl.dc_offset_v = new
-                self.scan_offset = new
-                self._norm_box(self.box_offset, f"{new:g}")
-                print(f"[offset] DC offset -> {new:.2f} V")
-            except Exception as exc:
-                print(f"[offset] failed: {exc}")
-                if _is_ctrl_error(exc):
-                    self._note_ctrl_failure(exc)
+            delta = 0.25 if event.key == "right" else -0.25
+            new = float(np.clip(self.scan_offset + delta, 0.0, 15.0))
+            self.scan_offset = new
+            self._norm_box(self.box_offset, f"{new:g}")
+            self._ctrl_do(f"DC offset -> {new:.2f} V",
+                          lambda c: setattr(c, "dc_offset_v", new))
 
     def _snapshot(self):
         os.makedirs(LOG_DIR, exist_ok=True)
@@ -1404,6 +1359,33 @@ class LiveApp:
             err_fit = res.fit_fwhm_err_s * res.hz_per_s
         total = float(np.hypot(err_fit, err_cal))
         return total if np.isfinite(total) and total > 0 else None
+
+    # -------------------------------------------- async controller writes
+    def _ctrl_do(self, label, fn):
+        """Queue a controller write; the UI state is already updated
+        optimistically, and a reconnect re-applies everything anyway."""
+        if self.ctrl is None:
+            self._no_ctrl_hint()
+            return
+        self._ctrl_q.put((label, fn))
+
+    def _ctrl_worker(self):
+        while True:
+            label, fn = self._ctrl_q.get()
+            ctrl = self.ctrl
+            if ctrl is None:
+                self._ctrl_q.task_done()
+                continue
+            try:
+                fn(ctrl)
+                print(f"[scan] {label}")
+            except Exception as exc:
+                print(f"[ctrl] {label} failed: {exc}")
+                self._ctrl_err = (f"{label} failed: {exc}", time.monotonic())
+                if _is_ctrl_error(exc):
+                    self._note_ctrl_failure(exc)
+            finally:
+                self._ctrl_q.task_done()
 
     # ------------------------------------------------- SA201B auto-reconnect
     def _note_ctrl_failure(self, exc) -> None:
@@ -1704,6 +1686,12 @@ class LiveApp:
         if res.transverse_frac is not None and res.transverse_frac > 0.5:
             warn.append("! strong transverse modes — improve alignment "
                         "(minimize the half-FSR peaks)")
+        if self._ctrl_err is not None:
+            msg, when = self._ctrl_err
+            if time.monotonic() - when < 8.0:
+                warn.append(f"! {msg}")
+            else:
+                self._ctrl_err = None
         if self.ctrl is None and not self.args.no_controller:
             warn.append("! SA201B USB disconnected — retrying...")
         if self.acq.status not in ("ok", "starting"):
@@ -1723,7 +1711,9 @@ class LiveApp:
         # A plain canvas timer instead of FuncAnimation: FuncAnimation forces
         # a full ~100 ms canvas redraw on every tick even when nothing
         # changed, which saturates the Tk event loop and lags the mouse.
-        self._timer = self.fig.canvas.new_timer(interval=250)
+        # Blit frames cost ~15-25 ms, so ~7 Hz still leaves the event loop
+        # mostly idle for mouse and widget traffic.
+        self._timer = self.fig.canvas.new_timer(interval=150)
         self._timer.add_callback(self._update, 0)
         self._timer.start()
         try:

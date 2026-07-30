@@ -160,6 +160,11 @@ and the **expand** dropdown (1×–100× sweep expansion). Changing the sweep
 time or expansion automatically resizes the scope's capture window (long
 sweeps also coarsen the sample interval to keep captures manageable).
 
+All controller writes are applied on a background worker: the UI reacts
+instantly, the SA201B follows ~half a second later (its serial link needs a
+set + verify round-trip), and a failed write shows a warning. If the write
+was lost to a USB dropout, the auto-reconnect re-applies your settings.
+
 **Align** (`t` key) switches the SA201B to a **triangle** scan — the manual's
 recommended waveform for initial cavity alignment — and the headline changes
 from linewidth to **peak height in volts**: walk the mirror mount to maximize
