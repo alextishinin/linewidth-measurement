@@ -1733,9 +1733,6 @@ class LiveApp:
             warn.append("! signal saturating — lower PD gain / input power")
         if cap.clipped:
             warn.append("! scope ADC clipped")
-        if res.transverse_frac is not None and res.transverse_frac > 0.5:
-            warn.append("! strong transverse modes — improve alignment "
-                        "(minimize the half-FSR peaks)")
         if self._ctrl_err is not None:
             msg, when = self._ctrl_err
             if time.monotonic() - when < 8.0:
