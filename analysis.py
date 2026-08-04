@@ -62,6 +62,9 @@ class SweepAnalysis:
     # half-FSR positions relative to the main peak (0 = clean TEM00,
     # ~1 = as tall as the fundamental). None when it cannot be assessed.
     transverse_frac: float | None = None
+    # True when this sweep's own FSR period looked like an outlier and the
+    # caller-provided robust (median) period was used for the Hz conversion
+    calibration_fallback: bool = False
     # health flags
     saturating: bool = False
     weak: bool = False
@@ -164,7 +167,8 @@ def analyze_sweep(t: np.ndarray, v: np.ndarray,
                   instrument_hz: float = config.INSTRUMENT_RES_HZ,
                   min_signal_v: float = 0.05,
                   expected_fsr_period_s: float | None = None,
-                  prefer_time_s: float | None = None) -> SweepAnalysis:
+                  prefer_time_s: float | None = None,
+                  robust_fsr_period_s: float | None = None) -> SweepAnalysis:
     out = SweepAnalysis(t=t, v=v)
     n = len(v)
     if n < 500:
@@ -374,11 +378,35 @@ def analyze_sweep(t: np.ndarray, v: np.ndarray,
     if lft is not None and rgt is not None:
         fsr_period = (rgt[0] - lft[0]) / 2
     elif lft is not None:
-        fsr_period = t_main - lft[0]
+        # one-sided: extrapolate the chirp from the second neighbour so the
+        # local period at t_main is recovered instead of the biased spacing
+        s1 = t_main - lft[0]
+        lft2 = _nearest_peak(apex_t, heights, lft[0] - s1,
+                             max(0.15 * s1, 6 * w0_main))
+        if lft2 is not None and lft2[1] >= 0.3 * main_h:
+            fsr_period = s1 + 0.5 * (s1 - (lft[0] - lft2[0]))
+        else:
+            fsr_period = s1
     elif rgt is not None:
-        fsr_period = rgt[0] - t_main
+        s1 = rgt[0] - t_main
+        rgt2 = _nearest_peak(apex_t, heights, rgt[0] + s1,
+                             max(0.15 * s1, 6 * w0_main))
+        if rgt2 is not None and rgt2[1] >= 0.3 * main_h:
+            fsr_period = s1 + 0.5 * (s1 - (rgt2[0] - rgt[0]))
+        else:
+            fsr_period = s1
 
     out.fsr_period_s = float(fsr_period)
+    # A single sweep's period can still misfire (a partner briefly lost to
+    # the window trim or a tolerance miss). The true period drifts slowly,
+    # so when the caller supplies the recent median and this sweep deviates
+    # by >4%, convert with the median instead and flag it.
+    period_used = fsr_period
+    if robust_fsr_period_s and robust_fsr_period_s > 0:
+        if abs(fsr_period / robust_fsr_period_s - 1.0) > 0.04:
+            period_used = robust_fsr_period_s
+            out.calibration_fallback = True
+    fsr_period = period_used
     out.hz_per_s = fsr_hz / fsr_period
     out.linewidth_hz = fwhm_s * out.hz_per_s
     if out.fwhm_direct_s:

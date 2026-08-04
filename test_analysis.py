@@ -141,6 +141,28 @@ def main() -> int:
     assert 0.75 * width_true < lw < 1.35 * width_true
     assert 0.25 < trans < 0.6, f"transverse fraction off: {trans}"
 
+    # -------------------------------- robust-period fallback (spike guard)
+    ctrl, scope = make_scope(modes=[(0.0, 1.0)], transverse=1.0,
+                             nonlinearity=0.20)
+    rise = ctrl.rise_time_s()
+    expected_T = rise * config.VOLTS_PER_FSR / ctrl.amplitude_v
+    cap = scope.capture()
+    tt, vw, _ = ana.trim_to_rising_ramp(cap, rise)
+    base = ana.analyze_sweep(tt, vw, expected_fsr_period_s=expected_T)
+    assert base.ok and not base.calibration_fallback
+    # median far from this sweep's own period -> fallback must engage
+    forced = ana.analyze_sweep(tt, vw, expected_fsr_period_s=expected_T,
+                               robust_fsr_period_s=base.fsr_period_s * 1.2)
+    assert forced.calibration_fallback, "fallback did not engage"
+    assert abs(forced.hz_per_s - config.FSR_HZ /
+               (base.fsr_period_s * 1.2)) < 1e-3 * forced.hz_per_s
+    # median consistent with this sweep -> no fallback, own period used
+    agree = ana.analyze_sweep(tt, vw, expected_fsr_period_s=expected_T,
+                              robust_fsr_period_s=base.fsr_period_s * 1.01)
+    assert not agree.calibration_fallback
+    print("[robust]     period fallback engages at >4% deviation, "
+          "stays off when consistent")
+
     # ------------------------------------------------- helpers & edge cases
     v, u = ana.wavelength_width(3e9, 1064.0)
     assert u == "pm" and abs(v - 11.33) < 0.1, (v, u)

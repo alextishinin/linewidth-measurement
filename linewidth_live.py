@@ -1473,7 +1473,8 @@ class LiveApp:
         if self._log_writer is None or res is None:
             return
         flags = ";".join(f for f, on in
-                         [("saturating", res.saturating), ("weak", res.weak)]
+                         [("saturating", res.saturating), ("weak", res.weak),
+                          ("cal-fallback", res.calibration_fallback)]
                          if on) or "ok" if res.ok else res.message
         now = time.time()
         self._log_writer.writerow([
@@ -1522,10 +1523,14 @@ class LiveApp:
         if self.scan_amplitude > 0:
             expected_T = (self.acq.rise_s * config.VOLTS_PER_FSR
                           / self.scan_amplitude)
+        robust_T = None
+        if len(self._fsr_hist) >= 5:
+            robust_T = float(np.median(self._fsr_hist))
         res = ana.analyze_sweep(t, v, fsr_hz=self.fsr_hz,
                                 instrument_hz=self.instrument_hz,
                                 expected_fsr_period_s=expected_T,
-                                prefer_time_s=self._prev_fit_center)
+                                prefer_time_s=self._prev_fit_center,
+                                robust_fsr_period_s=robust_T)
         if res.ok and res.fit_center_s is not None:
             self._prev_fit_center = res.fit_center_s
         self.last_result = res
