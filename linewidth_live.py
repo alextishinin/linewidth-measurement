@@ -1616,8 +1616,17 @@ class LiveApp:
 
         changed = self._bg is None
 
-        # ---- full sweep panel (envelope-decimated for fast redraws)
-        sx, sy = _decimate_envelope(t * 1e3, v)
+        # ---- full sweep panel (envelope-decimated for fast redraws; when
+        # the user has zoomed in, decimate only the visible span so close-ups
+        # show the raw samples instead of the min/max envelope pairs)
+        t_ms = t * 1e3
+        if self._user_zoom.get((id(self.ax_sweep), "x")):
+            vlo, vhi = self.ax_sweep.get_xlim()
+            ssel = (t_ms >= vlo) & (t_ms <= vhi)
+            sx, sy = (_decimate_envelope(t_ms[ssel], v[ssel])
+                      if ssel.sum() > 2 else (t_ms, v))
+        else:
+            sx, sy = _decimate_envelope(t_ms, v)
         self.ln_sweep.set_data(sx, sy)
         self.mk_peaks.set_data(res.peak_times * 1e3,
                                res.peak_heights + 0.06 * max(1e-3, np.max(v)))
@@ -1646,7 +1655,11 @@ class LiveApp:
                         span = q
                         break
                 xlo, xhi = -span, span
-            sel = (f_off >= xlo) & (f_off <= xhi)
+            if self._user_zoom.get((id(self.ax_zoom), "x")):
+                vlo, vhi = self.ax_zoom.get_xlim()   # follow the drag zoom
+            else:
+                vlo, vhi = xlo, xhi
+            sel = (f_off >= vlo) & (f_off <= vhi)
             zx, zy = _decimate_envelope(f_off[sel], v[sel])
             self.ln_zoom.set_data(zx, zy)
             if res.fit_t is not None:
@@ -1674,7 +1687,13 @@ class LiveApp:
         if self.history:
             xs = np.array([w - self.t_start for w, _ in self.history])
             ys = np.array([lw / 1e6 for _, lw in self.history])
-            dx, dy = _decimate_envelope(xs, ys, max_bins=240)
+            if self._user_zoom.get((id(self.ax_trend), "x")):
+                vlo, vhi = self.ax_trend.get_xlim()
+                tsel = (xs >= vlo) & (xs <= vhi)
+                dx, dy = ((xs[tsel], ys[tsel]) if 2 < tsel.sum() <= 480
+                          else _decimate_envelope(xs, ys, max_bins=240))
+            else:
+                dx, dy = _decimate_envelope(xs, ys, max_bins=240)
             self.ln_trend.set_data(dx, dy)
             if self.mode == "live":
                 # quantize the scroll to 10 s steps so the background (and
