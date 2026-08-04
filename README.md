@@ -69,10 +69,20 @@ shows a deconvolved estimate (measured − 67 MHz, valid for Lorentzian-ish
 shapes).
 
 **Uncertainty:** the headline reads `78.3 ± 2.1 MHz`. The 1σ error bar
-combines, in quadrature, the Lorentzian fit's own covariance on the width
-and the frequency-calibration error (the standard error of the FSR peak
-spacing over the last 20 sweeps, which sets the Hz-per-second scale). It is
-recorded in the CSV log and in exported files.
+combines, in quadrature, the Lorentzian fit's own covariance on the width,
+the frequency-calibration error (the standard error of the FSR peak spacing
+over the last 20 sweeps), and the standard error of the rolling median. It
+is recorded in the CSV log and in exported files.
+
+**Jitter and the rolling median.** A single sweep samples the laser-cavity
+frequency jitter during the ~µs peak transit, so individual widths scatter
+by a few percent with occasional outlier sweeps. In live mode the app
+therefore reports the **median of the last 11 sweeps** (~1.6 s;
+`--median N` to change, `--median 1` for raw), which is spike-free, while
+the per-sweep value is still logged (`linewidth_hz`) next to the reported
+one (`linewidth_median_hz`) — and the observed sweep-to-sweep scatter is
+itself displayed, since it is a direct measure of the jitter. Single-sweep
+mode always shows the individual sweep's value.
 
 ## Wiring
 

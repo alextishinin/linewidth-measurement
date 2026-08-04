@@ -153,6 +153,9 @@ def parse_args():
                    help="capture window in ms (default: auto from rise time)")
     p.add_argument("--avg", type=int, default=1,
                    help="average N consecutive triggered sweeps (default 1)")
+    p.add_argument("--median", type=int, default=11,
+                   help="report the rolling median of N sweeps in live mode "
+                        "(default 11 ~ 1.6 s; 1 = raw per-sweep values)")
     p.add_argument("--wavelength-nm", type=float, default=None,
                    help="laser wavelength in nm for the wavelength-units "
                         "display (editable in the app; persisted)")
@@ -422,6 +425,11 @@ class LiveApp:
         self._fsr_hist = collections.deque(maxlen=20)
         self._last_err_hz = None
         self._prev_fit_center = None     # sticky peak tracking across sweeps
+        # Single sweeps sample the laser's jitter during the ~us peak
+        # transit, so individual widths scatter by a few percent; the rolling
+        # median is the honest steady-state number in live mode.
+        self._lw_recent = collections.deque(maxlen=max(1, args.median))
+        self._lw_scatter_hz = None
         self._gain_cooldown_until = 0.0
         # cached copy of the SA201B gain index -- querying the device takes
         # ~100 ms of serial I/O, far too slow for the per-frame UI path
@@ -442,7 +450,8 @@ class LiveApp:
             self._log_file = open(self.log_path, "w", newline="")
             self._log_writer = csv.writer(self._log_file)
             self._log_writer.writerow(
-                ["unix_time", "iso_time", "linewidth_hz", "linewidth_direct_hz",
+                ["unix_time", "iso_time", "linewidth_hz",
+                 "linewidth_median_hz", "linewidth_direct_hz",
                  "deconvolved_hz", "finesse", "fsr_period_s", "hz_per_s",
                  "peak_v", "n_modes", "pd_gain_index", "wavelength_nm",
                  "linewidth_pm", "linewidth_err_hz", "transverse_frac",
@@ -1480,6 +1489,8 @@ class LiveApp:
         self._log_writer.writerow([
             f"{now:.3f}", _dt.datetime.now().isoformat(timespec="seconds"),
             f"{res.linewidth_hz:.6g}" if res.linewidth_hz else "",
+            (f"{self._disp_lw_hz:.6g}"
+             if getattr(self, "_disp_lw_hz", None) else ""),
             f"{res.linewidth_direct_hz:.6g}" if res.linewidth_direct_hz else "",
             f"{res.deconvolved_hz:.6g}" if res.deconvolved_hz is not None else "",
             f"{res.finesse:.1f}" if res.finesse else "",
@@ -1536,6 +1547,25 @@ class LiveApp:
         self.last_result = res
         self._auto_gain_step(res)
         self._last_err_hz = self._uncertainty_hz(res)
+
+        # rolling-median linewidth: single sweeps sample jitter; the median
+        # over ~1.6 s is the reported value in live mode (raw in single mode)
+        self._lw_scatter_hz = None
+        disp_lw = res.linewidth_hz
+        if res.ok and res.linewidth_hz and not self.align_mode:
+            self._lw_recent.append(res.linewidth_hz)
+        if len(self._lw_recent) >= 5:
+            arr = np.fromiter(self._lw_recent, dtype=float)
+            med = float(np.median(arr))
+            self._lw_scatter_hz = float(
+                1.4826 * np.median(np.abs(arr - med)))
+            if self.mode == "live" and res.ok and res.linewidth_hz:
+                disp_lw = med
+            if self._lw_scatter_hz and self._last_err_hz is not None:
+                se_med = 1.253 * self._lw_scatter_hz / np.sqrt(len(arr))
+                self._last_err_hz = float(np.hypot(self._last_err_hz, se_med))
+        self._disp_lw_hz = disp_lw
+
         if not self.align_mode:      # alignment sweeps don't pollute the log
             self._log(res)
 
@@ -1584,9 +1614,14 @@ class LiveApp:
             ztop = max(0.2, float(np.max(v[sel])) * 1.2) if sel.any() else 1.0
             changed |= self._lim(self.ax_zoom, "y", -0.04 * ztop, ztop)
 
-        # ---- trend panel
-        if res.ok and res.linewidth_hz and not self.align_mode:
-            self.history.append((wall, res.linewidth_hz))
+        # ---- trend panel (live mode waits out the median warm-up so the
+        # first seconds can't seed the history with raw jitter samples)
+        median_ready = (self.mode != "live"
+                        or self._lw_recent.maxlen <= 1
+                        or len(self._lw_recent) >= 5)
+        if res.ok and res.linewidth_hz and not self.align_mode \
+                and median_ready:
+            self.history.append((wall, self._disp_lw_hz))
         if self.mode == "live":     # in single mode old runs stay on screen
             cutoff = time.time() - self.args.history_s
             while self.history and self.history[0][0] < cutoff:
@@ -1621,16 +1656,17 @@ class LiveApp:
                        f"{res.transverse_frac * 100:.0f}% down")
             self.txt_sub.set_text(sub)
         elif res.ok and res.linewidth_hz:
+            show = self._disp_lw_hz or res.linewidth_hz
             err = self._last_err_hz
-            head = f"{res.linewidth_hz / 1e6:.1f}"
+            head = f"{show / 1e6:.1f}"
             if err:
                 head += f" ± {err / 1e6:.1f}"
             self.txt_head.set_text(head + " MHz")
-            wl_v, wl_u = ana.wavelength_width(res.linewidth_hz,
-                                              self.wavelength_nm)
+            wl_v, wl_u = ana.wavelength_width(show, self.wavelength_nm)
+            deconv = max(show - self.instrument_hz, 0.0)
             note = ("instrument-limited"
-                    if res.linewidth_hz < 1.35 * self.instrument_hz
-                    else f"est. laser ≈ {res.deconvolved_hz / 1e6:.0f} MHz "
+                    if show < 1.35 * self.instrument_hz
+                    else f"est. laser ≈ {deconv / 1e6:.0f} MHz "
                          f"(67 MHz removed)")
             self.txt_sub.set_text(
                 f"= {wl_v:.3g} {wl_u} @ {self.wavelength_nm:g} nm — {note}")
@@ -1642,9 +1678,14 @@ class LiveApp:
         if self.mode == "single" and self._last_single_stamp:
             stats.append(f"single sweep captured {self._last_single_stamp}")
         if self._last_err_hz and res.linewidth_hz:
-            frac = 100.0 * self._last_err_hz / res.linewidth_hz
+            ref = self._disp_lw_hz or res.linewidth_hz
+            frac = 100.0 * self._last_err_hz / ref
             stats.append(f"uncertainty: ±{self._last_err_hz / 1e6:.2f} MHz "
                          f"({frac:.1f}%, 1σ)")
+        if self._lw_scatter_hz:
+            stats.append(f"sweep-to-sweep scatter: "
+                         f"±{self._lw_scatter_hz / 1e6:.2f} MHz (jitter, "
+                         f"median of {len(self._lw_recent)})")
         if res.linewidth_direct_hz:
             stats.append(f"half-max width: {res.linewidth_direct_hz / 1e6:.1f} MHz")
         if res.fit_r2 is not None:
