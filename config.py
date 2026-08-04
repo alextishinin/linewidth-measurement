@@ -5,6 +5,9 @@ FSR_HZ = 10.0e9              # SA210 series free spectral range (confocal, c/4d)
 INSTRUMENT_RES_HZ = 67.0e6   # SA210 spec resolution (FSR / finesse, finesse >150)
 VOLTS_PER_FSR = 10.0         # SA210 manual: a 0-20 V sawtooth covers ~2 FSR;
                              # used only as a soft prior for FSR disambiguation
+VOLTS_PER_FSR_REF_NM = 1064.0
+# The piezo moves lambda/4 per FSR, so volts-per-FSR scales linearly with
+# wavelength: the prior is VOLTS_PER_FSR * (lambda / VOLTS_PER_FSR_REF_NM).
 
 # ---------------------------------------------------------------- SA201B (USB serial)
 SA201B_VID = 0x1313          # Thorlabs

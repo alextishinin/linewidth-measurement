@@ -1573,12 +1573,15 @@ class LiveApp:
                 wall).strftime("%H:%M:%S")
 
         t, v, ramp_end = ana.trim_to_rising_ramp(cap, self.acq.rise_s)
-        # nominal piezo calibration (~10 V/FSR) as a soft prior so the FSR
-        # search can tell a half-FSR transverse comb from the real spacing
+        # nominal piezo calibration as a soft prior so the FSR search can
+        # tell a half-FSR transverse comb from the real spacing. The piezo
+        # moves lambda/4 per FSR, so the volts-per-FSR figure scales with
+        # the wavelength entered in the lambda box.
         expected_T = None
         if self.scan_amplitude > 0:
-            expected_T = (self.acq.rise_s * config.VOLTS_PER_FSR
-                          / self.scan_amplitude)
+            v_per_fsr = (config.VOLTS_PER_FSR * self.wavelength_nm
+                         / config.VOLTS_PER_FSR_REF_NM)
+            expected_T = self.acq.rise_s * v_per_fsr / self.scan_amplitude
         robust_T = None
         if len(self._fsr_hist) >= 5:
             robust_T = float(np.median(self._fsr_hist))

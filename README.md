@@ -20,6 +20,10 @@ Lorentzian fitting, auto-gain, and CSV export.
 | 3× BNC cables + the SMA→BNC cable shipped with the SA210 | wiring below |
 
 Other SA210/SA200-series cavities work too — pass your FSR with `--fsr-ghz`.
+Swapping wavelength bands (e.g. an SA210-12B for 1550 nm) needs no code
+changes: set the laser wavelength in the in-app λ box — it feeds both the
+Δλ display **and** the piezo calibration prior, which scales with λ because
+the mirror moves λ/4 per free spectral range.
 
 ## Installation
 
