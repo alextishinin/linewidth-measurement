@@ -567,9 +567,14 @@ class LiveApp:
             # matplotlib 3.11 bug: TextBox._resize is wrapped by a decorator
             # that expects mouse events, so plain ResizeEvents (no .inaxes)
             # raise AttributeError on every window resize. An undecorated
-            # override restores the intended stop-typing behavior.
+            # override restores the intended stop-typing behavior -- but
+            # ONLY while typing: stop_typing() ends in an unconditional full
+            # canvas.draw(), and Tk's periodic DPI check fires ResizeEvents
+            # constantly, which otherwise costs a ~230 ms redraw per box
+            # every couple of seconds forever.
             def _resize(self, event):
-                self.stop_typing()
+                if self.capturekeystrokes:
+                    self.stop_typing()
 
         def _style(widget, wax):
             widget.label.set_fontsize(9)
@@ -707,9 +712,12 @@ class LiveApp:
         # Blitting: the full figure takes >100 ms to draw, which is what made
         # the UI lag. Dynamic artists are marked animated and blitted over a
         # cached background; a full draw happens only when axis limits move.
+        # txt_stats deliberately NOT animated: its ~14-line layout costs
+        # ~37 ms per draw (vs 1.5 ms for a one-liner), so it lives in the
+        # cached background and is re-baked at most every few seconds.
         self._animated = [self.ln_sweep, self.mk_peaks, self.ln_zoom,
                           self.ln_fit, self.ln_trend, self.txt_head,
-                          self.txt_sub, self.txt_stats, self.txt_status,
+                          self.txt_sub, self.txt_status,
                           *self._zoom_rect.values()]
         for a in self._animated:
             a.set_animated(True)
@@ -724,14 +732,43 @@ class LiveApp:
                              self.box_span_min, self.box_span_max]
         self._widget_axes = [w.ax for w in
                              (*self._theme_buttons, *self._theme_boxes)]
+        # hover bookkeeping: only the widget under the cursor (plus the one
+        # whose hover state may be baked into the background) gets redrawn
+        # per blit -- redrawing all 14 cost ~30 ms/frame
+        self._widget_ax_set = set(self._widget_axes)
+        self._hover_ax = None
+        self._bg_hover_ax = None
+        self._stats_baked_at = 0.0
+        self._shown_vals = {}
         self._bg = None
         self.fig.canvas.mpl_connect("draw_event", self._on_draw)
+        self.fig.canvas.mpl_connect("motion_notify_event", self._on_hover)
         self._apply_theme(self.theme_name)
         self._sync_theme_button()
+
+    def _on_hover(self, event):
+        ax = event.inaxes
+        self._hover_ax = ax if ax in self._widget_ax_set else None
+
+    def _shown(self, key, value, quantum):
+        """Display hysteresis: the shown value moves only when the live one
+        drifts a full quantum away, so quantized stats strings don't chatter
+        on rounding boundaries (every chatter costs a ~250 ms re-bake)."""
+        if value is None:
+            self._shown_vals.pop(key, None)
+            return None
+        shown = self._shown_vals.get(key)
+        if shown is None or abs(value - shown) >= quantum:
+            self._shown_vals[key] = value
+            shown = value
+        return shown
 
     def _on_draw(self, _event):
         """After any full draw: cache the background, re-add dynamic artists."""
         self._bg = self.fig.canvas.copy_from_bbox(self.fig.bbox)
+        self._bg_hover_ax = self._hover_ax   # this hover state is baked in
+        self._stats_baked_at = time.monotonic()
+        self._stats_shown = self.txt_stats.get_text()
         for a in self._animated:
             self.fig.draw_artist(a)
 
@@ -762,8 +799,13 @@ class LiveApp:
                 self._auto_lims[key] = cur
                 return False
         else:
-            inside = lo >= cur[0] - 1e-12 and hi <= cur[1] + 1e-12
-            fills = (hi - lo) > 0.55 * (cur[1] - cur[0])
+            # deadband: requests carry their own padding, so tolerating a
+            # few % of drift never clips data -- but it stops noise-level
+            # request creep from regenerating ticks (a ~230 ms full draw)
+            cur_span = cur[1] - cur[0]
+            tol = 0.05 * cur_span
+            inside = lo >= cur[0] - tol and hi <= cur[1] + tol
+            fills = (hi - lo) > 0.55 * cur_span
             if inside and fills:
                 self._auto_lims[key] = cur
                 return False
@@ -868,7 +910,9 @@ class LiveApp:
         canvas.restore_region(self._bg)
         for a in self._animated:
             self.fig.draw_artist(a)
-        for wax in self._widget_axes:
+        # only widgets whose live state can differ from the background:
+        # the one under the cursor and the one baked while hovered
+        for wax in {self._hover_ax, self._bg_hover_ax} - {None}:
             self.fig.draw_artist(wax)
         canvas.blit(self.fig.bbox)
 
@@ -1521,6 +1565,7 @@ class LiveApp:
             if not self._armed or item[0] < self._arm_time:
                 return      # frozen, or waiting for a sweep newer than the click
         self._last_processed = item[0]
+        t_frame0 = time.perf_counter()
         wall, cap = item
         if self.mode == "single":
             self._armed = False
@@ -1629,7 +1674,8 @@ class LiveApp:
         if self.history:
             xs = np.array([w - self.t_start for w, _ in self.history])
             ys = np.array([lw / 1e6 for _, lw in self.history])
-            self.ln_trend.set_data(xs, ys)
+            dx, dy = _decimate_envelope(xs, ys, max_bins=240)
+            self.ln_trend.set_data(dx, dy)
             if self.mode == "live":
                 # quantize the scroll to 10 s steps so the background (and
                 # tick labels) only regenerate occasionally, not every frame
@@ -1674,27 +1720,31 @@ class LiveApp:
             self.txt_head.set_text("—")
             self.txt_sub.set_text("")
 
+        # NOTE: the stats block lives in the cached background, and every
+        # change to its string costs one ~230 ms full redraw -- so values
+        # here are quantized coarsely enough to be stable between sweeps
+        # (the live headline carries the precise numbers).
         stats = []
         if self.mode == "single" and self._last_single_stamp:
             stats.append(f"single sweep captured {self._last_single_stamp}")
-        if self._last_err_hz and res.linewidth_hz:
-            ref = self._disp_lw_hz or res.linewidth_hz
-            frac = 100.0 * self._last_err_hz / ref
-            stats.append(f"uncertainty: ±{self._last_err_hz / 1e6:.2f} MHz "
-                         f"({frac:.1f}%, 1σ)")
-        if self._lw_scatter_hz:
-            stats.append(f"sweep-to-sweep scatter: "
-                         f"±{self._lw_scatter_hz / 1e6:.2f} MHz (jitter, "
-                         f"median of {len(self._lw_recent)})")
-        if res.linewidth_direct_hz:
-            stats.append(f"half-max width: {res.linewidth_direct_hz / 1e6:.1f} MHz")
-        if res.fit_r2 is not None:
-            stats.append(f"fit R²: {res.fit_r2:.3f}")
-        if res.finesse:
-            stats.append(f"effective finesse: {res.finesse:.0f}  (spec >150)")
-        if res.fsr_period_s:
-            stats.append(f"FSR spacing: {res.fsr_period_s * 1e3:.2f} ms "
-                         f"→ {res.hz_per_s / 1e12:.2f} GHz/ms")
+        sc = self._shown("scatter", self._lw_scatter_hz, 0.2e6)
+        if sc:
+            stats.append(f"sweep-to-sweep scatter: ±{sc / 1e6:.1f} MHz "
+                         f"(jitter, median of {self._lw_recent.maxlen})")
+        dw = self._shown("direct", res.linewidth_direct_hz, 2e6)
+        if dw:
+            stats.append(f"half-max width: {dw / 1e6:.0f} MHz")
+        r2 = self._shown("r2", res.fit_r2, 0.02)
+        if r2 is not None:
+            stats.append(f"fit R²: {r2:.2f}")
+        fin = self._shown("finesse", res.finesse, 15)
+        if fin:
+            stats.append(f"effective finesse: ~{round(fin / 10) * 10}"
+                         f"  (spec >150)")
+        fsr_ms = self._shown("fsr", res.fsr_period_s, 0.05e-3)
+        if fsr_ms:
+            stats.append(f"FSR spacing: {fsr_ms * 1e3:.2f} ms "
+                         f"→ {self.fsr_hz / fsr_ms / 1e12:.2f} GHz/ms")
         n_modes = len(res.mode_offsets_hz)
         if n_modes > 1:
             spacings = np.diff(sorted(res.mode_offsets_hz)) / 1e6
@@ -1702,8 +1752,8 @@ class LiveApp:
                          f"(spacing {', '.join(f'{s:.0f}' for s in spacings)} MHz)")
         elif res.ok:
             stats.append("modes in one FSR: 1 (single-frequency)")
-        if res.transverse_frac is not None:
-            frac = res.transverse_frac
+        frac = self._shown("trans", res.transverse_frac, 0.04)
+        if frac is not None:
             tag = ("good" if frac < 0.05 else
                    "fair" if frac < 0.20 else "poor")
             stats.append(f"transverse modes: {frac * 100:.0f}% of main "
@@ -1720,11 +1770,18 @@ class LiveApp:
         if self.align_mode:
             stats.append("ALIGNMENT MODE — triangle scan, not logged")
         if self.mode == "live" and self.acq.sweep_period_s:
-            stats.append(f"sweep rate: {1.0 / self.acq.sweep_period_s:.1f} Hz"
-                         f"   window: {self.acq.window_s * 1e3:.1f} ms")
+            rate = self._shown("rate", 1.0 / self.acq.sweep_period_s, 2.0)
+            stats.append(f"sweep rate: {rate:.0f} Hz"
+                         f"   window: {self.acq.window_s * 1e3:.0f} ms")
         if self.log_path:
             stats.append(f"log: {os.path.basename(self.log_path)}")
-        self.txt_stats.set_text("\n".join(stats))
+        new_stats = "\n".join(stats)
+        self.txt_stats.set_text(new_stats)
+        # stats live in the background; re-bake (full draw) at most every
+        # 2.5 s when the content actually changed
+        if (new_stats != getattr(self, "_stats_shown", None)
+                and time.monotonic() - self._stats_baked_at > 6.0):
+            changed = True
 
         warn = []
         if not res.ok:
@@ -1751,6 +1808,17 @@ class LiveApp:
             self.fig.canvas.draw()       # _on_draw refreshes the background
         else:
             self._blit()
+
+        # adaptive pacing: the render loop may never occupy more than ~50%
+        # of the event loop, whatever this frame cost on this screen -- so
+        # mouse clicks and typing always have idle time to run in
+        frame_ms = (time.perf_counter() - t_frame0) * 1e3
+        tmr = getattr(self, "_timer", None)
+        if tmr is not None:
+            try:
+                tmr.interval = int(min(1000.0, max(150.0, 2.0 * frame_ms)))
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ run
     def run(self):
