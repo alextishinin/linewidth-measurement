@@ -163,7 +163,8 @@ def analyze_sweep(t: np.ndarray, v: np.ndarray,
                   fsr_hz: float = config.FSR_HZ,
                   instrument_hz: float = config.INSTRUMENT_RES_HZ,
                   min_signal_v: float = 0.05,
-                  expected_fsr_period_s: float | None = None) -> SweepAnalysis:
+                  expected_fsr_period_s: float | None = None,
+                  prefer_time_s: float | None = None) -> SweepAnalysis:
     out = SweepAnalysis(t=t, v=v)
     n = len(v)
     if n < 500:
@@ -199,7 +200,27 @@ def analyze_sweep(t: np.ndarray, v: np.ndarray,
     apex_t = np.array([_parabolic_apex(t, vv, i) for i in peaks])
     out.peak_times = apex_t
     out.peak_heights = heights + baseline
-    i_main = 0
+
+    # -------------------------------------------------- main-peak selection
+    # With several near-equal peaks (the usual FP comb), "the tallest" is a
+    # per-sweep noise lottery -- and the first/last peaks of the sweep get a
+    # one-sided, chirp-biased calibration. So among competitive peaks
+    # (within 12% of the max) prefer interior ones, take the one nearest
+    # the previously analyzed position when given (sticky tracking), and
+    # otherwise the one nearest the sweep center.
+    cand_idx = list(np.where(heights >= 0.88 * heights[0])[0])
+    if len(apex_t) >= 3:
+        t_edge_lo, t_edge_hi = apex_t.min(), apex_t.max()
+        interior = [i for i in cand_idx
+                    if apex_t[i] not in (t_edge_lo, t_edge_hi)]
+        if interior:
+            cand_idx = interior
+    center = 0.5 * (t[0] + t[-1])
+    i_main = min(cand_idx, key=lambda i: abs(apex_t[i] - center))
+    if prefer_time_s is not None:
+        near = min(cand_idx, key=lambda i: abs(apex_t[i] - prefer_time_s))
+        if abs(apex_t[near] - prefer_time_s) <= 0.06 * (t[-1] - t[0]):
+            i_main = near
     t_main = apex_t[i_main]
 
     # ------------------------------------------- FSR period candidate set
@@ -268,8 +289,9 @@ def analyze_sweep(t: np.ndarray, v: np.ndarray,
 
     # ------------------------------------------------------ main-peak width
     gap = np.inf
-    for tt in apex_t[1:]:
-        gap = min(gap, abs(tt - t_main))
+    for j, tt in enumerate(apex_t):
+        if j != i_main:
+            gap = min(gap, abs(tt - t_main))
     w0 = max(widths_s[i_main], 4 * dt)
     half_win = min(6 * w0, 0.45 * gap if np.isfinite(gap) else 6 * w0)
     half_win = max(half_win, 8 * dt)

@@ -103,6 +103,33 @@ def main() -> int:
     assert n_modes_tr == 1, \
         f"transverse peaks leaked into the mode list ({n_modes_tr})"
 
+    # Peak selection must be deterministic and edge-avoiding: with six
+    # near-identical peaks, sweep-to-sweep scatter should be tight (the old
+    # tallest-peak lottery produced +-6% telegraph jumps from one-sided
+    # edge calibrations).
+    ctrl, scope = make_scope(modes=[(0.0, 1.0)], transverse=1.0,
+                             nonlinearity=0.20)
+    rise = ctrl.rise_time_s()
+    expected_T = rise * config.VOLTS_PER_FSR / ctrl.amplitude_v
+    lws, centers = [], []
+    prev_center = None
+    for _ in range(12):
+        cap = scope.capture()
+        tt, vw, _ = ana.trim_to_rising_ramp(cap, rise)
+        r = ana.analyze_sweep(tt, vw, expected_fsr_period_s=expected_T,
+                              prefer_time_s=prev_center)
+        assert r.ok
+        prev_center = r.fit_center_s
+        lws.append(r.linewidth_hz)
+        centers.append(r.fit_center_s)
+        # never an edge peak while interior candidates exist
+        assert r.peak_times.min() < r.fit_center_s < r.peak_times.max(), \
+            "edge peak selected for the linewidth fit"
+    spread = float(np.std(lws) / np.mean(lws))
+    print(f"[stability]  12 sweeps: {np.mean(lws) / 1e6:.1f} MHz, "
+          f"relative std {spread * 100:.1f}%")
+    assert spread < 0.05, f"linewidth telegraphing: {spread * 100:.1f}% std"
+
     # ------------------------- 4. moderate, alternating transverse comb
     ctrl, scope = make_scope(modes=[(0.0, 1.0)], transverse=0.4,
                              nonlinearity=0.10)

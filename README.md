@@ -54,7 +54,11 @@ instrument spec (an impossibly *good* answer means the ruler is wrong),
 requires an actual partner peak one period away, and picks among the
 survivors using the piezo's nominal ~10 V/FSR as a soft prior. The spacing
 is then measured as the average of the left and right neighbour gaps, which
-cancels the chirp to first order at the analyzed peak.
+cancels the chirp to first order at the analyzed peak. The analyzed peak
+itself is chosen deterministically — a competitive interior peak nearest the
+sweep center (or the previously tracked one) — because with several
+near-equal peaks, "the tallest" is a per-sweep noise lottery, and edge peaks
+only permit a one-sided, chirp-biased calibration.
 
 **Resolution floor:** the measured width is the laser lineshape *convolved*
 with the instrument function (~67 MHz). A laser much narrower than 67 MHz

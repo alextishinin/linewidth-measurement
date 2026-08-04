@@ -421,6 +421,7 @@ class LiveApp:
         threading.Thread(target=self._ctrl_worker, daemon=True).start()
         self._fsr_hist = collections.deque(maxlen=20)
         self._last_err_hz = None
+        self._prev_fit_center = None     # sticky peak tracking across sweeps
         self._gain_cooldown_until = 0.0
         # cached copy of the SA201B gain index -- querying the device takes
         # ~100 ms of serial I/O, far too slow for the per-frame UI path
@@ -1523,7 +1524,10 @@ class LiveApp:
                           / self.scan_amplitude)
         res = ana.analyze_sweep(t, v, fsr_hz=self.fsr_hz,
                                 instrument_hz=self.instrument_hz,
-                                expected_fsr_period_s=expected_T)
+                                expected_fsr_period_s=expected_T,
+                                prefer_time_s=self._prev_fit_center)
+        if res.ok and res.fit_center_s is not None:
+            self._prev_fit_center = res.fit_center_s
         self.last_result = res
         self._auto_gain_step(res)
         self._last_err_hz = self._uncertainty_hz(res)
