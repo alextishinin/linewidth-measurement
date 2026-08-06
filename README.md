@@ -10,6 +10,10 @@ Lorentzian fitting, auto-gain, and CSV export.
 ![python](https://img.shields.io/badge/python-3.11%2B-green)
 [![license](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
+📖 **[Full user & hardware manual (PDF)](docs/MANUAL.pdf)** — every control,
+wiring, optical alignment, data formats, troubleshooting, and the procedure
+for changing the measured wavelength. (HTML source: [docs/manual.html](docs/manual.html).)
+
 ## Hardware
 
 | Instrument | Role |

@@ -1,0 +1,770 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SA210 Laser Linewidth Measurement System — User &amp; Hardware Manual</title>
+<style>
+  @page { size: A4; margin: 12mm 12mm 14mm 12mm; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: "Segoe UI", Arial, sans-serif;
+    font-size: 10.5pt; line-height: 1.45; color: #111;
+    margin: 0; padding: 0;
+  }
+  .titlepage { text-align: center; padding-top: 60mm; page-break-after: always; }
+  .titlepage h1 { font-size: 24pt; margin: 0 0 6mm; }
+  .titlepage .sub { font-size: 13pt; color: #444; margin-bottom: 18mm; }
+  .titlepage .meta { font-size: 10pt; color: #666; }
+  h1 { font-size: 16pt; border-bottom: 2px solid #2a78d6; padding-bottom: 2mm;
+       margin: 0 0 4mm; page-break-before: always; page-break-after: avoid; }
+  h1.first { page-break-before: avoid; }
+  h2 { font-size: 12.5pt; margin: 6mm 0 2mm; color: #1a4f8f; page-break-after: avoid; }
+  h3 { font-size: 11pt; margin: 4mm 0 1.5mm; page-break-after: avoid; }
+  p { margin: 0 0 2.5mm; }
+  table { border-collapse: collapse; width: 100%; margin: 2mm 0 4mm;
+          font-size: 9.5pt; page-break-inside: avoid; }
+  th, td { border: 1px solid #bbb; padding: 1.2mm 2mm; text-align: left;
+           vertical-align: top; }
+  th { background: #eef3fa; }
+  code, .mono { font-family: Consolas, "Courier New", monospace; font-size: 9.5pt;
+         background: #f4f4f2; padding: 0 1mm; border-radius: 1px; }
+  pre { font-family: Consolas, monospace; font-size: 9pt; background: #f4f4f2;
+        border: 1px solid #ddd; padding: 2mm; margin: 2mm 0 4mm;
+        white-space: pre-wrap; page-break-inside: avoid; }
+  .figure { text-align: center; margin: 4mm 0; page-break-inside: avoid; }
+  .figure img, .figure svg { max-width: 100%; }
+  .figure .cap { font-size: 9pt; color: #555; margin-top: 1.5mm; }
+  .note { border-left: 3mm solid #2a78d6; background: #f0f5fc;
+          padding: 2mm 3mm; margin: 3mm 0; page-break-inside: avoid; }
+  .warn { border-left: 3mm solid #d03b3b; background: #fdf1f1;
+          padding: 2mm 3mm; margin: 3mm 0; page-break-inside: avoid; }
+  ul, ol { margin: 0 0 3mm; padding-left: 6mm; }
+  li { margin-bottom: 1mm; }
+  .toc { font-size: 10.5pt; }
+  .toc ol { list-style: none; padding-left: 0; }
+  .toc > ol > li { margin-bottom: 1.5mm; font-weight: 600; }
+  .toc ol ol { padding-left: 6mm; font-weight: 400; margin: 0.5mm 0; }
+  .kbd { border: 1px solid #999; border-bottom-width: 2px; border-radius: 2px;
+         padding: 0 1.2mm; font-family: Consolas, monospace; font-size: 9.5pt;
+         background: #fafafa; }
+</style>
+</head>
+<body>
+
+<!-- ==================================================== TITLE PAGE -->
+<div class="titlepage">
+  <h1>Laser Linewidth Measurement System</h1>
+  <div class="sub">Thorlabs SA210 scanning Fabry-Pérot · SA201B controller ·
+    PicoScope 5242D<br>User &amp; Hardware Manual</div>
+  <div class="meta">
+    Application version: August 2026 (PySide6 / PyQtGraph interface)<br>
+    Repository: github.com/alextishinin/linewidth-measurement · MIT License<br>
+    Covers software commit 34b9bd4 and later
+  </div>
+</div>
+
+<!-- ==================================================== TOC -->
+<h1 class="first">Contents</h1>
+<div class="toc">
+<ol>
+  <li>1&nbsp;&nbsp;System overview</li>
+  <li>2&nbsp;&nbsp;Hardware
+    <ol><li>2.1 Parts list · 2.2 Wiring · 2.3 Optical layout · 2.4 Power &amp; bench notes</li></ol></li>
+  <li>3&nbsp;&nbsp;Software installation &amp; the kiosk setup</li>
+  <li>4&nbsp;&nbsp;Alignment procedure</li>
+  <li>5&nbsp;&nbsp;Application tour — every control explained
+    <ol><li>5.1 The three graphs · 5.2 Graph-header controls · 5.3 Side panel ·
+      5.4 Readouts &amp; stats · 5.5 Keyboard shortcuts</li></ol></li>
+  <li>6&nbsp;&nbsp;Measurement modes (Live, Single, Align)</li>
+  <li>7&nbsp;&nbsp;How the measurement works</li>
+  <li>8&nbsp;&nbsp;Data: logging, export, snapshots, settings
+    <ol><li>8.1 Session log · 8.2 Export files · 8.3 Snapshots · 8.4 settings.json</li></ol></li>
+  <li>9&nbsp;&nbsp;Measuring a different wavelength</li>
+  <li>10 Command-line reference</li>
+  <li>11 Troubleshooting</li>
+  <li>12 Maintenance, tests &amp; specifications</li>
+</ol>
+</div>
+
+<!-- ==================================================== 1 OVERVIEW -->
+<h1>1&nbsp;&nbsp;System overview</h1>
+<p>This system measures the <b>linewidth (FWHM) of a continuous-wave laser</b>
+in real time. A Thorlabs SA210 scanning confocal Fabry-Pérot interferometer
+sweeps its cavity length with a piezo; every time the cavity passes through
+resonance with the laser, a transmission peak appears on the built-in
+photodiode. The SA201B controller generates the piezo ramp and amplifies the
+photodiode signal; a PicoScope 5242D digitizes it; and the Python application
+on this PC finds the peaks, calibrates the time axis into optical frequency,
+fits a Lorentzian to the main peak, and displays the linewidth live —
+together with its uncertainty, the cavity finesse, mode structure, and a
+running history. Every sweep is logged to CSV.</p>
+
+<div class="figure">
+<svg viewBox="0 0 760 150" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Arial" font-size="12">
+  <defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+    <path d="M0,0 L8,4 L0,8 z" fill="#333"/></marker></defs>
+  <rect x="8"  y="55" width="80" height="40" fill="#eef3fa" stroke="#2a78d6"/>
+  <text x="48" y="79" text-anchor="middle">Laser</text>
+  <rect x="128" y="55" width="120" height="40" fill="#eef3fa" stroke="#2a78d6"/>
+  <text x="188" y="72" text-anchor="middle">Mirror + lens</text>
+  <text x="188" y="88" text-anchor="middle" font-size="10">(mode matching)</text>
+  <rect x="288" y="55" width="110" height="40" fill="#eef3fa" stroke="#2a78d6"/>
+  <text x="343" y="72" text-anchor="middle">SA210</text>
+  <text x="343" y="88" text-anchor="middle" font-size="10">Fabry-Pérot</text>
+  <rect x="438" y="55" width="100" height="40" fill="#eef3fa" stroke="#2a78d6"/>
+  <text x="488" y="72" text-anchor="middle">SA201B</text>
+  <text x="488" y="88" text-anchor="middle" font-size="10">controller</text>
+  <rect x="578" y="55" width="100" height="40" fill="#eef3fa" stroke="#2a78d6"/>
+  <text x="628" y="72" text-anchor="middle">PicoScope</text>
+  <text x="628" y="88" text-anchor="middle" font-size="10">5242D</text>
+  <rect x="702" y="55" width="50" height="40" fill="#eef3fa" stroke="#2a78d6"/>
+  <text x="727" y="79" text-anchor="middle">PC</text>
+  <line x1="88"  y1="75" x2="126" y2="75" stroke="#333" marker-end="url(#ah)"/>
+  <line x1="248" y1="75" x2="286" y2="75" stroke="#333" marker-end="url(#ah)"/>
+  <line x1="398" y1="68" x2="436" y2="68" stroke="#333" marker-end="url(#ah)"/>
+  <line x1="436" y1="82" x2="398" y2="82" stroke="#333" marker-end="url(#ah)"/>
+  <text x="417" y="60" text-anchor="middle" font-size="9">PD (SMA)</text>
+  <text x="417" y="96" text-anchor="middle" font-size="9">piezo drive</text>
+  <line x1="538" y1="75" x2="576" y2="75" stroke="#333" marker-end="url(#ah)"/>
+  <text x="557" y="68" text-anchor="middle" font-size="9">3× BNC</text>
+  <line x1="678" y1="75" x2="700" y2="75" stroke="#333" marker-end="url(#ah)"/>
+  <text x="689" y="68" text-anchor="middle" font-size="9">USB</text>
+  <line x1="488" y1="97" x2="488" y2="120" stroke="#333"/>
+  <line x1="488" y1="120" x2="720" y2="120" stroke="#333"/>
+  <line x1="720" y1="120" x2="720" y2="97" stroke="#333" marker-end="url(#ah)"/>
+  <text x="604" y="133" text-anchor="middle" font-size="9">USB (remote control of the ramp &amp; gain)</text>
+</svg>
+<div class="cap">Figure 1 — signal chain.</div>
+</div>
+
+<table>
+<tr><th>Quantity</th><th>Value</th></tr>
+<tr><td>Free spectral range (FSR)</td><td>10 GHz (SA210 series, confocal, FSR = c/4d)</td></tr>
+<tr><td>Instrument resolution</td><td>~67 MHz (FSR / finesse, minimum spec finesse 150)</td></tr>
+<tr><td>Measurable linewidth</td><td>≈67 MHz (instrument floor) up to a few GHz</td></tr>
+<tr><td>Wavelength range (current cavity, SA210-8B)</td><td>820–1275 nm</td></tr>
+<tr><td>Digitizer</td><td>15-bit, 2 MS/s default (16-bit in single-channel mode)</td></tr>
+<tr><td>Update rate (live mode)</td><td>one analyzed sweep per ramp, typically 5–10 per second</td></tr>
+</table>
+
+<div class="note"><b>Resolution floor.</b> The measured width is the laser
+lineshape <i>convolved</i> with the ~67 MHz instrument function. A laser much
+narrower than 67 MHz reads ≈67 MHz regardless — that result means
+“narrower than the instrument can resolve.” The app flags this state as
+<i>instrument-limited</i> and, for broader lasers, also shows a deconvolved
+estimate (measured − 67 MHz).</div>
+
+<!-- ==================================================== 2 HARDWARE -->
+<h1>2&nbsp;&nbsp;Hardware</h1>
+
+<h2>2.1 Parts list</h2>
+<table>
+<tr><th>Item</th><th>Role</th></tr>
+<tr><td>Thorlabs <b>SA210-8B</b> scanning Fabry-Pérot (820–1275 nm)</td>
+    <td>the interferometer; photodiode is built into the head</td></tr>
+<tr><td>Thorlabs <b>SA201B</b> controller</td>
+    <td>piezo ramp generator + photodiode transimpedance amplifier; USB-controlled</td></tr>
+<tr><td>Pico Technology <b>PicoScope 5242D</b></td>
+    <td>digitizer (any 5000D-series model works)</td></tr>
+<tr><td>3× BNC cables + the SMA→BNC cable shipped with the SA210</td><td>signal wiring</td></tr>
+<tr><td>Ø1&Prime; kinematic mount (Thorlabs KM100) for the SA210</td><td>tip/tilt alignment</td></tr>
+<tr><td>Fold mirror (bench: Newport 10DER.2 broadband dielectric) + kinematic mount</td>
+    <td>beam steering into the cavity</td></tr>
+<tr><td>f = 100 mm achromatic doublet, AR-coated 400–1100 nm</td>
+    <td>mode-matching lens (focus at the cavity center)</td></tr>
+<tr><td>Windows 10/11 PC + monitor</td><td>runs this application (dedicated bench PC)</td></tr>
+</table>
+
+<h2>2.2 Wiring</h2>
+<table>
+<tr><th>From</th><th>To</th><th>Cable</th></tr>
+<tr><td>SA210 permanently attached cable (piezo)</td>
+    <td>SA201B rear <b>OUTPUT</b> (0–45 V)</td><td>its own BNC</td></tr>
+<tr><td>SA210 detector <b>SMA</b> connector</td>
+    <td>SA201B rear <b>PD AMPLIFIER IN</b> (labeled “photocurrent in” on some units — same input)</td>
+    <td>SMA→BNC (supplied)</td></tr>
+<tr><td>SA201B front <b>PD AMPLIFIER OUT</b></td><td>PicoScope <b>Channel A</b></td><td>BNC</td></tr>
+<tr><td>SA201B front <b>TRIGGER OUT</b> (5 V TTL at each ramp start)</td>
+    <td>PicoScope <b>EXT</b> trigger input</td><td>BNC</td></tr>
+<tr><td>SA201B rear <b>MONITOR OUT</b> (ramp monitor)</td>
+    <td>PicoScope <b>Channel B</b> <i>(recommended, optional)</i></td><td>BNC</td></tr>
+<tr><td>SA201B USB-B and PicoScope USB-B</td><td>the PC</td><td>USB (scope on USB 3)</td></tr>
+</table>
+
+<div class="figure">
+<svg viewBox="0 0 760 210" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Arial" font-size="11">
+  <defs><marker id="ah2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+    <path d="M0,0 L8,4 L0,8 z" fill="#333"/></marker></defs>
+  <rect x="20" y="30" width="150" height="90" fill="#eef3fa" stroke="#2a78d6"/>
+  <text x="95" y="50" text-anchor="middle" font-weight="bold">SA210 head</text>
+  <text x="95" y="70" text-anchor="middle" font-size="9">piezo cable (attached)</text>
+  <text x="95" y="102" text-anchor="middle" font-size="9">detector SMA</text>
+  <rect x="290" y="15" width="180" height="150" fill="#eef3fa" stroke="#2a78d6"/>
+  <text x="380" y="33" text-anchor="middle" font-weight="bold">SA201B</text>
+  <text x="380" y="47" text-anchor="middle" font-size="9">rear: OUTPUT · PD AMP IN · MONITOR OUT</text>
+  <text x="380" y="59" text-anchor="middle" font-size="9">front: PD AMP OUT · TRIGGER OUT</text>
+  <rect x="580" y="15" width="160" height="150" fill="#eef3fa" stroke="#2a78d6"/>
+  <text x="660" y="33" text-anchor="middle" font-weight="bold">PicoScope 5242D</text>
+  <line x1="170" y1="65"  x2="288" y2="65"  stroke="#333" marker-end="url(#ah2)"/>
+  <text x="229" y="58" text-anchor="middle" font-size="9">piezo → OUTPUT 0–45 V</text>
+  <line x1="170" y1="98"  x2="288" y2="98"  stroke="#333" marker-end="url(#ah2)"/>
+  <text x="229" y="91" text-anchor="middle" font-size="9">SMA → PD AMPLIFIER IN</text>
+  <line x1="470" y1="65"  x2="578" y2="65"  stroke="#333" marker-end="url(#ah2)"/>
+  <text x="524" y="58" text-anchor="middle" font-size="9">PD AMP OUT → Ch A</text>
+  <line x1="470" y1="98"  x2="578" y2="98"  stroke="#333" marker-end="url(#ah2)"/>
+  <text x="524" y="91" text-anchor="middle" font-size="9">TRIGGER OUT → EXT</text>
+  <line x1="470" y1="131" x2="578" y2="131" stroke="#333" stroke-dasharray="4 3" marker-end="url(#ah2)"/>
+  <text x="524" y="124" text-anchor="middle" font-size="9">MONITOR OUT → Ch B (opt.)</text>
+  <line x1="380" y1="165" x2="380" y2="190" stroke="#333"/>
+  <line x1="660" y1="165" x2="660" y2="190" stroke="#333"/>
+  <line x1="380" y1="190" x2="520" y2="190" stroke="#333"/>
+  <line x1="660" y1="190" x2="520" y2="190" stroke="#333" marker-end="url(#ah2)"/>
+  <text x="520" y="203" text-anchor="middle" font-size="9">both USB → PC</text>
+</svg>
+<div class="cap">Figure 2 — cabling. The dashed Channel-B line is optional: with it, the
+app measures the true ramp duration every capture and resizes its window
+automatically; without it, launch with <code>--single-channel</code> (the scope then
+digitizes at 16 bit instead of 15).</div>
+</div>
+
+<h2>2.3 Optical layout</h2>
+<ul>
+<li>Mount the SA210 in the Ø1&Prime; kinematic mount. Keep the input beam diameter
+    around 1 mm.</li>
+<li>Steer the beam with the fold mirror into the SA210's input iris; place the
+    f = 100 mm lens so its focus lands at the <b>cavity center, about 25 mm past
+    the front flange</b>. Good mode matching minimizes transverse modes
+    (section 4).</li>
+<li>Both irises on the SA210 help: close the input iris to center the beam,
+    open the back iris while walking the mount.</li>
+</ul>
+
+<div class="warn"><b>Optical power.</b> A few hundred µW to a few mW of CW power
+is plenty — the photodiode amplifier at its lowest gain (10k V/A) saturates
+around 5 V output well below damaging levels. If the app warns
+<i>“signal saturating”</i> at 10k gain, attenuate the beam. Consult the SA210
+manual's damage threshold before sending in more than ~10 mW.</div>
+
+<h2>2.4 Power &amp; bench notes</h2>
+<p>Three mains loads (SA201B, PC, monitor) run from one switched power strip
+mounted at the bench, so the whole station powers up together; the instruments
+enumerate over USB while the app's startup loop retries for up to a minute
+(section 3). The PC is dedicated to this instrument and launches the app
+automatically at logon.</p>
+
+<!-- ==================================================== 3 INSTALL -->
+<h1>3&nbsp;&nbsp;Software installation &amp; the kiosk setup</h1>
+<ol>
+<li>Windows 10/11 with Python 3.12+ (<code>winget install Python.Python.3.12</code>).</li>
+<li>In the repository folder: <code>pip install -r requirements.txt</code>
+    (installs numpy, scipy, PySide6, pyqtgraph, pyserial, picosdk).</li>
+<li>Install <b>PicoSDK 64-bit</b> from picotech.com/downloads — it provides
+    <code>ps5000a.dll</code>. The default install path
+    <code>C:\Program Files\Pico Technology\SDK</code> is what
+    <code>config.py</code> expects; edit <code>PICO_SDK_LIB</code> there if yours differs.</li>
+<li>Wire the instruments per section 2.2, connect both USB cables, and run
+    <code>run.bat</code> (or <code>python linewidth_live.py</code>). If your Python
+    is installed elsewhere, edit the path inside <code>run.bat</code>.</li>
+</ol>
+
+<h3>Kiosk behavior on this bench PC</h3>
+<ul>
+<li><b>Auto-start:</b> a shortcut named <i>Linewidth Measurement</i> in the
+    user's Startup folder (<code>shell:startup</code>) launches <code>run.bat</code> at
+    every logon; the window opens maximized. Delete the shortcut to disable.</li>
+<li><b>Desktop icon:</b> the same shortcut sits on the desktop for manual launch.</li>
+<li><b>Startup retries:</b> after power-up, USB instruments can take a while to
+    enumerate. The app retries opening the hardware 12 times at 5 s intervals
+    (~1 minute) before giving up with a diagnostic message.</li>
+<li><b>Only one owner:</b> close the PicoScope 7 desktop application before
+    launching — only one program can hold the scope at a time.</li>
+</ul>
+
+<!-- ==================================================== 4 ALIGNMENT -->
+<h1>4&nbsp;&nbsp;Alignment procedure</h1>
+<ol>
+<li>Start the app (live mode, sawtooth running). Click <b>Align</b> (or press
+    <span class="kbd">t</span>): the controller switches to a <b>triangle</b> scan —
+    the waveform Thorlabs recommends for alignment — and the big headline
+    switches from linewidth to <b>peak height in volts</b>.</li>
+<li>Center the beam: close the SA210 input iris, and steer the fold mirror
+    until the transmitted spot is centered; open the iris again.</li>
+<li>Watch the <b>Full sweep</b> graph while walking the SA210 mount's tip/tilt:
+    make peaks appear, then maximize their height. Tall, sharp,
+    <i>non-split</i> peaks indicate good coupling.</li>
+<li>Now minimize the <b>transverse modes</b> percentage shown in the subtitle
+    (and in the stats panel). Odd transverse modes of a confocal cavity appear
+    exactly halfway between the main peaks; their relative height is a direct
+    mode-matching meter:
+    <b>&lt;5% good</b>, 5–20% fair, &gt;20% poor. Adjust tip/tilt and the lens
+    focus position to push it down.</li>
+<li>Click <b>Align</b> again to return to the sawtooth and normal measurement.
+    Alignment sweeps are never logged and never enter the history plot.</li>
+</ol>
+<div class="note">Peak height and mode purity are both alignment criteria:
+height first (signal), then purity (single transverse mode). A perfectly
+mode-matched confocal cavity shows only the main comb.</div>
+
+<!-- ==================================================== 5 APP TOUR -->
+<h1>5&nbsp;&nbsp;Application tour — every control explained</h1>
+
+<div class="figure">
+<img src="app-screenshot.png" alt="Application window">
+<div class="cap">Figure 3 — the application (dark theme, simulator data).
+Left: the three graphs, each with its own header bar and <i>reset view</i>
+button; the x-range control sits above the second graph. Right: the side
+panel with the headline readout, statistics, and all input controls.</div>
+</div>
+
+<h2>5.1 The three graphs</h2>
+<table>
+<tr><th>Graph</th><th>Shows</th></tr>
+<tr><td><b>Full sweep</b> (top)</td><td>The photodiode amplifier output across one
+  piezo ramp, in volts vs. milliseconds. Small triangles mark detected peaks.
+  With a 30 V ramp expect the same pattern about 3 times — once per FSR.
+  Use this panel while aligning.</td></tr>
+<tr><td><b>Main peak, frequency calibrated</b> (middle)</td><td>The same sweep
+  re-plotted in optical frequency offset (MHz) around the analyzed peak, with
+  the Lorentzian fit dashed on top. Several peaks inside one FSR = several
+  longitudinal laser modes; their spacings are listed in the stats panel.</td></tr>
+<tr><td><b>Linewidth (FWHM) history</b> (bottom)</td><td>Measured FWHM vs.
+  elapsed time. In live mode the last 3 minutes scroll; in single mode every
+  <i>Run once</i> adds one point and old points stay.</td></tr>
+</table>
+
+<h3>Zooming (all three graphs, even while streaming)</h3>
+<ul>
+<li><b>Drag a box</b> with the left mouse button to zoom into it.</li>
+<li><b>Scroll wheel</b> zooms around the cursor; dragging or scrolling
+    <i>on an axis</i> rescales that axis alone.</li>
+<li>Any manual zoom <b>pauses auto-ranging for that graph</b> so the view stays
+    put; its <b>reset view</b> button turns bold to show this. Zoomed-in views
+    always show raw samples (the display only downsamples what a full view
+    cannot resolve).</li>
+<li><b>reset view</b> (per graph) or <span class="kbd">v</span> (all graphs)
+    restores auto-ranging.</li>
+</ul>
+
+<h2>5.2 Graph-header controls</h2>
+<table>
+<tr><th>Control</th><th>Function</th></tr>
+<tr><td><b>reset view</b> (one per graph)</td><td>Restores that graph's automatic
+  ranging after a manual zoom. Bold label = a manual zoom is active.</td></tr>
+<tr><td><b>x-range</b> dropdown (graph 2)</td><td>Chooses the frequency window of the
+  calibrated-peak graph:<br>
+  · <b>Auto</b> — follows the fitted linewidth and any neighboring modes.<br>
+  · <b>Full 10 GHz</b> — the whole FSR (−5000…+5000 MHz), every mode of one
+    order at once; useful for spotting half-FSR transverse modes.<br>
+  · <b>Manual</b> — the min/max boxes (MHz, each −5000…+5000, max &gt; min)
+    set the window; typing in either box switches to Manual automatically.
+  The choice persists across sessions. A drag-zoom overrides it temporarily;
+  reset view returns to the selected mode.</td></tr>
+</table>
+
+<h2>5.3 Side panel — buttons and input boxes</h2>
+<table>
+<tr><th>Control</th><th>Function</th></tr>
+<tr><td><b>Light / Dark</b> button (top right)</td><td>Toggles the color theme
+  (the label names the theme you would switch <i>to</i>). Dark is the default;
+  the choice is persisted. Also key <span class="kbd">d</span>.</td></tr>
+<tr><td><b>laser λ nm (100–5000)</b></td><td>The laser wavelength. Feeds the
+  Δλ display (the linewidth in pm/fm), the exported files, the CSV log, and
+  the piezo calibration prior (section 7). Type a value and press Enter.
+  Out-of-range entries are rejected with a message. Persisted.</td></tr>
+<tr><td><b>ampl V (1–30)</b></td><td>Piezo ramp amplitude. Rule of thumb on the
+  SA210: ~1 V per GHz of optical span, so 30 V ≈ 3 FSR. Applied to the
+  SA201B over USB in the background (~0.5 s). Persisted.</td></tr>
+<tr><td><b>offs V (0–15)</b></td><td>DC offset added to the ramp — slides the
+  whole peak pattern along the sweep. Also nudged by the
+  <span class="kbd">←</span>/<span class="kbd">→</span> keys (±0.25 V). Persisted.</td></tr>
+<tr><td><b>sweep ms (10–100)</b></td><td>Ramp rise time at 1× expansion, snapped
+  to the SA201B's 0–200 step grid. Changing it automatically resizes the
+  scope's capture window. Persisted.</td></tr>
+<tr><td><b>expand</b> dropdown</td><td>SA201B sweep expansion ×1, ×2, ×5, ×10,
+  ×20, ×50, ×100 — multiplies the sweep time for slow, fine scans. Long sweeps
+  automatically coarsen the sample interval to keep captures manageable.
+  Persisted.</td></tr>
+<tr><td><b>PD gain (V/A)</b> dropdown</td><td><b>Auto</b> (default): the app
+  steps the SA201B photodiode amplifier gain <i>down</i> when the 5 V output
+  saturates and <i>up</i> when the tallest peak falls below ~0.35 V, with a 4 s
+  cooldown between steps. <b>10k / 100k / 1M</b> lock that transimpedance gain
+  manually. The stats panel shows the gain actually in effect. Persisted.</td></tr>
+<tr><td><b>Run once</b></td><td>In single mode (switching to it if needed):
+  arms exactly one capture — the sweep is taken, analyzed, displayed, and
+  acquisition stops again. Key <span class="kbd">r</span>.</td></tr>
+<tr><td><b>Mode: Live / Single</b></td><td>Toggles between continuous streaming
+  and single-sweep mode (section 6). Key <span class="kbd">m</span>.</td></tr>
+<tr><td><b>Export data</b></td><td>Writes the currently displayed sweep and the
+  linewidth history to CSV files in <code>exports\</code> (section 8.2).
+  Key <span class="kbd">e</span>.</td></tr>
+<tr><td><b>Align: off / TRI</b></td><td>Toggles alignment mode — triangle scan,
+  peak-height headline, nothing logged (section 4). Key <span class="kbd">t</span>.</td></tr>
+</table>
+<div class="note">Every input box shows its valid range in its label. Values
+are applied optimistically — the UI reacts instantly while the controller
+write completes in the background; a failed write shows a warning, and the
+auto-reconnect re-applies your settings after a USB dropout.</div>
+
+<h2>5.4 Readouts and the stats panel</h2>
+<p><b>Headline</b> (large number): the linewidth FWHM in MHz with its 1σ
+uncertainty, e.g. <code>66.5 ± 1.3 MHz</code>. In live mode this is the median of
+the last 11 sweeps (spike-free); in single mode it is that sweep's own value.
+In Align mode it becomes the peak height in volts.</p>
+<p><b>Subtitle</b>: the same width converted to wavelength units at the current
+λ (e.g. <code>= 251 fm @ 1064 nm</code>), plus either
+<i>instrument-limited</i> (reading is at the ~67 MHz floor) or an estimated
+deconvolved laser width.</p>
+<p><b>Warning area</b> (red): analysis problems (<i>no signal…</i>), signal
+saturation, scope ADC clipping, controller-write failures, USB disconnects,
+and missing-trigger conditions appear here and clear automatically.</p>
+<p><b>Stats block</b>, line by line (lines appear only when relevant):</p>
+<table>
+<tr><th>Line</th><th>Meaning</th></tr>
+<tr><td>single sweep captured HH:MM:SS</td><td>timestamp of the last Run once</td></tr>
+<tr><td>sweep-to-sweep scatter: ±x MHz</td><td>MAD-based scatter of recent raw
+  sweeps — a direct measure of laser-cavity jitter (section 7)</td></tr>
+<tr><td>half-max width</td><td>direct width at half maximum, without the
+  Lorentzian fit — a fit-independent cross-check</td></tr>
+<tr><td>fit R²</td><td>goodness of the Lorentzian fit (1.000 = perfect)</td></tr>
+<tr><td>effective finesse</td><td>FSR ÷ measured width; the SA210 spec is
+  &gt;150, so ≥150 confirms the instrument performs to spec</td></tr>
+<tr><td>FSR spacing</td><td>measured peak-repeat period in ms and the resulting
+  calibration slope in GHz/ms</td></tr>
+<tr><td>modes in one FSR</td><td>number of longitudinal laser modes detected,
+  with their spacings in MHz</td></tr>
+<tr><td>transverse modes: N%</td><td>strongest half-FSR peak relative to the
+  main peak — the alignment meter (good &lt; 5% &lt; fair &lt; 20% &lt; poor)</td></tr>
+<tr><td>PD gain</td><td>the transimpedance gain currently in effect ([auto] if
+  chosen automatically)</td></tr>
+<tr><td>scan: …</td><td>current ramp amplitude, sweep time × expansion, offset</td></tr>
+<tr><td>sweep rate / window</td><td>ramps per second and the scope capture window</td></tr>
+<tr><td>log: session_….csv</td><td>the CSV file this session is writing</td></tr>
+</table>
+
+<h2>5.5 Keyboard shortcuts</h2>
+<table>
+<tr><th>Key</th><th>Action</th><th>Key</th><th>Action</th></tr>
+<tr><td><span class="kbd">r</span></td><td>Run one sweep (single mode)</td>
+    <td><span class="kbd">e</span></td><td>Export data to CSV</td></tr>
+<tr><td><span class="kbd">m</span></td><td>toggle Live / Single mode</td>
+    <td><span class="kbd">s</span></td><td>snapshot (PNG + raw CSV)</td></tr>
+<tr><td><span class="kbd">t</span></td><td>toggle Align mode</td>
+    <td><span class="kbd">d</span></td><td>dark / light theme</td></tr>
+<tr><td><span class="kbd">g</span></td><td>cycle PD gain manually</td>
+    <td><span class="kbd">v</span></td><td>reset all zoomed views</td></tr>
+<tr><td><span class="kbd">a</span></td><td>toggle auto-gain</td>
+    <td><span class="kbd">p</span></td><td>pause / resume the display</td></tr>
+<tr><td><span class="kbd">←</span> / <span class="kbd">→</span></td><td>DC offset ±0.25 V</td>
+    <td><span class="kbd">q</span></td><td>quit (identical to closing the window)</td></tr>
+</table>
+<p>Keys are ignored while the cursor is in an input box.</p>
+
+<!-- ==================================================== 6 MODES -->
+<h1>6&nbsp;&nbsp;Measurement modes</h1>
+<h2>Live mode (default)</h2>
+<p>The scope captures every ramp; each triggered sweep is analyzed and
+displayed, the reported linewidth is the rolling median of the last 11
+sweeps, and every sweep is appended to the session log. The history graph
+scrolls over the last 3 minutes (<code>--history-s</code> to change).</p>
+<h2>Single-sweep mode</h2>
+<p>Switch with <b>Mode</b> (<span class="kbd">m</span>) or start with
+<code>--single</code>. The scope is <i>completely idle</i> — no data is acquired
+(the PicoScope LED stops flashing) until you press <b>Run once</b>
+(<span class="kbd">r</span>), which arms exactly one capture (or N averaged
+sweeps with <code>--avg N</code>). The result freezes on screen; each run adds
+one point to the history, and old points never expire. Ideal for documenting
+discrete measurements.</p>
+<h2>Align mode</h2>
+<p>Overlay on either mode (<span class="kbd">t</span>): triangle scan,
+peak-height headline, live transverse-mode meter, nothing logged. See
+section 4.</p>
+
+<!-- ==================================================== 7 HOW IT WORKS -->
+<h1>7&nbsp;&nbsp;How the measurement works</h1>
+<h2>7.1 From sweep to spectrum</h2>
+<p>The SA201B sweeps the cavity mirror with a sawtooth; the piezo moves
+λ/4 of mirror travel per free spectral range. The same laser line therefore
+re-appears every FSR, and the time between two repeats corresponds to exactly
+10 GHz. The app measures that repeat period on every sweep and uses it to
+convert time to optical frequency — <b>the frequency axis is self-calibrating
+and assumes nothing about the ramp slope</b>.</p>
+<h2>7.2 The calibration guards</h2>
+<p>Finding the repeat period robustly is the heart of the instrument, because
+two effects can fool a naive search: the piezo's nonlinearity <i>chirps</i>
+the peak spacing across the sweep (spacings drift 10–20%), and a misaligned
+confocal cavity adds odd transverse modes <b>exactly halfway between the
+fundamentals</b> — a comb at FSR/2 that can look identical to the real one.
+The algorithm therefore:</p>
+<ol>
+<li>builds candidate periods from tall-peak spacings and from the sweep's
+    autocorrelation (each candidate also doubled, in case the raw candidate
+    was the half-FSR comb);</li>
+<li>rejects candidates that imply a finesse beyond ~1.5× the instrument spec —
+    an impossibly <i>good</i> answer means the ruler is wrong — or that have no
+    actual partner peak one period away;</li>
+<li>picks among the survivors using the piezo's nominal response
+    (~10 V per FSR at 1064 nm, scaled by the λ-box value since piezo travel
+    per FSR is λ/4) as a soft prior;</li>
+<li>measures the final spacing as the average of the left and right neighbor
+    gaps of the analyzed peak, which cancels the chirp to first order;</li>
+<li>falls back to the median period of the last 20 sweeps if a single sweep's
+    calibration deviates &gt;4% (flagged <code>cal-fallback</code> in the log).</li>
+</ol>
+<p>The analyzed peak itself is chosen deterministically — a competitive
+interior peak nearest the sweep center, sticky to the previously tracked one —
+because with several near-equal peaks, “the tallest” would be a per-sweep
+noise lottery.</p>
+<h2>7.3 Lorentzian fit, jitter, and the median</h2>
+<p>A Lorentzian is fitted to the analyzed peak; its FWHM in calibrated units
+is the linewidth. A single peak transit lasts only ~µs, so each sweep
+samples the instantaneous laser-cavity frequency jitter: raw per-sweep widths
+scatter by a few percent with occasional outliers. In live mode the app
+reports the <b>median of the last 11 sweeps</b> (~1.6 s of data;
+<code>--median N</code> to change, <code>--median 1</code> for raw), which is
+spike-free — while the raw value of every sweep is still logged unmodified.
+The observed scatter is itself displayed, as it directly measures the jitter.</p>
+<h2>7.4 The uncertainty budget</h2>
+<p>The headline's ± is a 1σ error combining, in quadrature:</p>
+<ul>
+<li>the Lorentzian fit's covariance on the width,</li>
+<li>the frequency-calibration error — the standard error of the FSR peak
+    spacing over the last 20 sweeps,</li>
+<li>the standard error of the rolling median (1.253·σ/√N).</li>
+</ul>
+<p>It is recorded in the log and in exported files.</p>
+
+<!-- ==================================================== 8 DATA -->
+<h1>8&nbsp;&nbsp;Data: logging, export, snapshots, settings</h1>
+<div class="note"><b>Raw data is never altered.</b> Statistics (the rolling
+median, the uncertainty) are always <i>added</i> in separate columns; the raw
+per-sweep measurement is logged unconditionally in every mode.</div>
+
+<h2>8.1 The session log (automatic)</h2>
+<p>Every launch creates <code>logs\session_YYYYMMDD_HHMMSS.csv</code> (disable with
+<code>--no-log</code>). One row per analyzed sweep; align-mode sweeps are excluded.
+The file is flushed every ~5 s and closed on exit. Columns:</p>
+<table>
+<tr><th>Column</th><th>Content</th></tr>
+<tr><td><code>unix_time</code>, <code>iso_time</code></td><td>capture timestamp (epoch seconds; ISO local time)</td></tr>
+<tr><td><code>linewidth_hz</code></td><td><b>raw</b> per-sweep fitted FWHM</td></tr>
+<tr><td><code>linewidth_median_hz</code></td><td>the reported rolling median (live mode)</td></tr>
+<tr><td><code>linewidth_direct_hz</code></td><td>direct half-maximum width, fit-independent</td></tr>
+<tr><td><code>deconvolved_hz</code></td><td>measured − 67 MHz instrument function (≥0)</td></tr>
+<tr><td><code>finesse</code></td><td>effective finesse (FSR ÷ width)</td></tr>
+<tr><td><code>fsr_period_s</code>, <code>hz_per_s</code></td><td>measured FSR repeat period and calibration slope</td></tr>
+<tr><td><code>peak_v</code></td><td>tallest peak height in volts</td></tr>
+<tr><td><code>n_modes</code></td><td>longitudinal modes found in one FSR</td></tr>
+<tr><td><code>pd_gain_index</code></td><td>0 / 1 / 2 = 10k / 100k / 1M V/A</td></tr>
+<tr><td><code>wavelength_nm</code>, <code>linewidth_pm</code></td><td>λ-box value and the width as Δλ in pm</td></tr>
+<tr><td><code>linewidth_err_hz</code></td><td>the 1σ uncertainty (section 7.4)</td></tr>
+<tr><td><code>transverse_frac</code></td><td>transverse-mode fraction 0–1</td></tr>
+<tr><td><code>flags</code></td><td><code>ok</code>, or any of <code>saturating</code> /
+  <code>weak</code> / <code>cal-fallback</code> (semicolon-joined), or the analysis
+  error message</td></tr>
+</table>
+
+<h2>8.2 Export (on demand)</h2>
+<p><b>Export data</b> (<span class="kbd">e</span>) writes to <code>exports\</code>:</p>
+<ul>
+<li><code>sweep_YYYYMMDD_HHMMSS.csv</code> — the displayed sweep:
+    columns <code>time_s, signal_v, freq_offset_mhz, fit_v</code>, preceded by a
+    <code>#</code> metadata header (export time, λ, FSR, calibration slope, FWHM
+    in MHz with 1σ, FWHM in wavelength units, finesse, transverse fraction,
+    PD gain, mode).</li>
+<li><code>history_YYYYMMDD_HHMMSS.csv</code> — the linewidth trend:
+    <code>iso_time, elapsed_s, linewidth_mhz, linewidth_pm</code>.</li>
+</ul>
+<p>Works in live or single mode; the file names appear in the status area
+after a successful export.</p>
+
+<h2>8.3 Snapshots</h2>
+<p><span class="kbd">s</span> saves to <code>logs\</code>: a <b>PNG screenshot</b>
+of the whole window (in the active theme) and a <b>raw CSV</b> of the displayed
+sweep (<code>time_s, signal_v</code>) — a quick lab-notebook record.</p>
+
+<h2>8.4 settings.json (automatic persistence)</h2>
+<p>On every exit the app writes <code>settings.json</code> next to the program and
+restores it on launch: wavelength, theme, ramp amplitude / offset / sweep time /
+expansion, gain choice (auto or fixed index), and the graph-2 x-range mode and
+manual bounds. Precedence at startup:
+<b>explicit CLI flag → saved value → built-in default</b> — so a one-off
+<code>--wavelength-nm 780</code> wins for that session without overwriting your
+saved setup. Delete <code>settings.json</code> to return to factory defaults.</p>
+
+<!-- ==================================================== 9 WAVELENGTH -->
+<h1>9&nbsp;&nbsp;Measuring a different wavelength</h1>
+<h2>9.1 Inside the current cavity's band (820–1275 nm): app only</h2>
+<p>Nothing physical needs to change. Type the new wavelength into the
+<b>laser λ nm</b> box and press Enter. This updates:</p>
+<ul>
+<li>the <b>Δλ display</b> and all pm/fm conversions in exports and the log
+    (Δλ = λ²·Δν∕c, so the same 67 MHz reads ~0.25 pm at 1064 nm but
+    ~0.54 pm at 1550 nm);</li>
+<li>the <b>piezo calibration prior</b>: the mirror moves λ/4 per FSR, so the
+    volts-per-FSR figure scales linearly with λ. The prior only breaks ties
+    between calibration candidates — the frequency axis itself is always
+    measured from the peak repeats, so even a wrong λ cannot corrupt the
+    linewidth. It just weakens the disambiguation.</li>
+</ul>
+<p>Then re-align (section 4) — steering and focus are wavelength-dependent.</p>
+
+<h2>9.2 Outside the band (e.g. 1550 nm): swap the cavity head</h2>
+<p>The current SA210-8B mirrors and photodiode cover 820–1275 nm. For
+1550 nm, swap the interferometer head for an <b>SA210-12B</b> (1275–2000 nm).
+All SA210-series heads share the same 10 GHz FSR and the same connections, so:</p>
+<ol>
+<li><b>Physically:</b> swap the head in the same Ø1&Prime; mount; reconnect its
+    piezo cable to SA201B <b>OUTPUT</b> and its detector SMA to
+    <b>PD AMPLIFIER IN</b>. The photodiode is built into the head, so the
+    detector swap is automatic — the SA201B amplifier doesn't care.</li>
+<li><b>Optics:</b> check every optic's coating for the new band. The bench's
+    achromat is AR-coated 400–1100 nm — replace it with a 1050–1700 nm coated
+    doublet of the same focal length; verify the fold mirror's coating covers
+    1550 nm (use an IR-band dielectric mirror, e.g. a 1280–1600 nm class
+    coating, if not). An IR viewing card or camera is needed for alignment —
+    the beam is invisible.</li>
+<li><b>In the app:</b> type <code>1550</code> in the λ box. Done — no code changes,
+    no CLI flags; the FSR is unchanged so the calibration works as before,
+    and the prior scales itself.</li>
+<li><b>Re-align</b> from scratch (section 4).</li>
+</ol>
+
+<h2>9.3 A different-FSR cavity (higher resolution)</h2>
+<p>Other Thorlabs scanning FP series (e.g. the SA200 family, FSR 1.5 GHz,
+resolution down to ~7.5 MHz) also work. Launch with the cavity's numbers,
+e.g.:</p>
+<pre>python linewidth_live.py --fsr-ghz 1.5 --instrument-mhz 7.5</pre>
+<p>Everything else — calibration, guards, display ranges, the “Full FSR”
+x-range label — follows those two flags automatically. Check the specific
+model's datasheet for its FSR, finesse, and wavelength band.</p>
+
+<!-- ==================================================== 10 CLI -->
+<h1>10&nbsp;&nbsp;Command-line reference</h1>
+<p>All flags are optional; flags marked <i>(persisted)</i> default to your
+last-used in-app value. <code>run.bat</code> passes any arguments through.</p>
+<table>
+<tr><th>Flag</th><th>Meaning</th></tr>
+<tr><td><code>--single</code></td><td>start in single-sweep mode</td></tr>
+<tr><td><code>--port COM3</code></td><td>SA201B COM port (default: autodetect by USB ID)</td></tr>
+<tr><td><code>--no-controller</code></td><td>don't talk to the SA201B; set the ramp on its touchscreen (pass <code>--rise-ms</code> if not 10 ms)</td></tr>
+<tr><td><code>--single-channel</code></td><td>MONITOR OUT not wired; photodiode only, 16-bit</td></tr>
+<tr><td><code>--amplitude 30</code></td><td>ramp amplitude V, 1–30 <i>(persisted)</i></td></tr>
+<tr><td><code>--offset 0</code></td><td>ramp DC offset V, 0–15 <i>(persisted)</i></td></tr>
+<tr><td><code>--risetime-step 0</code></td><td>sweep-time step 0–200 → 10–100 ms <i>(persisted as sweep ms)</i></td></tr>
+<tr><td><code>--sweep-expand 0</code></td><td>expansion index 0–6 = 1×–100× <i>(persisted)</i></td></tr>
+<tr><td><code>--pdgain auto</code></td><td><code>auto</code>, or fixed index <code>0</code>/<code>1</code>/<code>2</code> = 10k/100k/1M V/A <i>(persisted)</i></td></tr>
+<tr><td><code>--rise-ms 10</code></td><td>sweep time when running with <code>--no-controller</code></td></tr>
+<tr><td><code>--dt-us 0.5</code></td><td>target sample interval (0.5 µs ≈ 45 samples across a 67 MHz feature)</td></tr>
+<tr><td><code>--window-ms</code></td><td>fixed capture window (default: auto from the sweep time)</td></tr>
+<tr><td><code>--avg 1</code></td><td>average N triggered sweeps before analysis</td></tr>
+<tr><td><code>--median 11</code></td><td>live-mode rolling-median length (1 = report raw sweeps)</td></tr>
+<tr><td><code>--wavelength-nm 1064</code></td><td>laser wavelength <i>(persisted)</i></td></tr>
+<tr><td><code>--theme dark</code></td><td><code>dark</code> or <code>light</code> <i>(persisted)</i></td></tr>
+<tr><td><code>--fsr-ghz 10</code></td><td>cavity FSR (SA210 = 10)</td></tr>
+<tr><td><code>--instrument-mhz 67</code></td><td>instrument resolution (SA210 spec = 67)</td></tr>
+<tr><td><code>--history-s 180</code></td><td>live-mode history window, seconds</td></tr>
+<tr><td><code>--no-log</code></td><td>disable the session CSV log</td></tr>
+</table>
+
+<!-- ==================================================== 11 TROUBLESHOOT -->
+<h1>11&nbsp;&nbsp;Troubleshooting</h1>
+<table>
+<tr><th>Symptom</th><th>Cause &amp; fix</th></tr>
+<tr><td><i>no trigger — is SA201B TRIGGER OUT connected…</i></td>
+  <td>The scope's EXT input sees no ramp-start pulse. Check the TRIGGER
+  OUT → EXT BNC and that the ramp is actually running (SA201B screen).</td></tr>
+<tr><td><i>no signal — check laser alignment into the SA210</i></td>
+  <td>Triggered sweeps but no peaks above ~0.35 V at any gain: the beam
+  misses the cavity, the laser is off/blocked, or the power is far too low.
+  Re-align (section 4).</td></tr>
+<tr><td><i>! signal saturating</i></td>
+  <td>PD amplifier output at the 5 V rail: auto-gain will step down; at 10k
+  V/A already, attenuate the beam.</td></tr>
+<tr><td><i>! scope ADC clipped</i></td>
+  <td>The digitizer range clipped a sample; usually accompanies saturation
+  and clears when the level drops.</td></tr>
+<tr><td><i>! SA201B USB disconnected — retrying…</i></td>
+  <td>The controller's serial link dropped. Measurement continues (the ramp
+  free-runs); the app reconnects automatically and re-applies amplitude,
+  offset, sweep time, expansion, gain and waveform. Check the USB cable if
+  it persists.</td></tr>
+<tr><td>Startup fails with <code>PICO_NOT_FOUND</code></td>
+  <td>Another program owns the scope (close PicoScope 7), the USB cable
+  dropped — or a previous process was <b>force-killed mid-capture</b>, which
+  wedges the driver with a stuck request. In that last case only a
+  <b>reboot</b> frees the unit. Prevention: always close the app with its
+  window's ✕ or <span class="kbd">q</span>; never end it from Task Manager
+  while it is capturing. The app prints <code>[exit] scope released</code> on
+  every clean shutdown.</td></tr>
+<tr><td>App doesn't appear right after power-on</td>
+  <td>USB enumeration can lag a cold boot; the launcher retries for ~1 min.
+  If it gave up, double-click the desktop icon.</td></tr>
+<tr><td>Peaks halfway between the main peaks</td>
+  <td>Odd transverse modes — an alignment/mode-matching indicator, not extra
+  laser modes. Minimize the <i>transverse modes %</i> (section 4). They are
+  automatically excluded from the mode count and calibration.</td></tr>
+<tr><td>More “modes” than expected, all equal height</td>
+  <td>Verify the frequency axis before believing it: check that the peak
+  pattern repeats ~once per 10 V of ramp (the SA210's nominal piezo response
+  at 1 µm). Two laser modes spaced near FSR/2 (mod FSR) can mimic a doubled
+  comb — perturb the laser (e.g. pump power): real two-mode beat spacing
+  moves, the piezo's repeat spacing does not.</td></tr>
+<tr><td>Linewidth reads ≈67 MHz and won't go lower</td>
+  <td>That's the instrument floor — the laser is narrower than the SA210 can
+  resolve (the subtitle says <i>instrument-limited</i>). The reading is an
+  upper bound.</td></tr>
+<tr><td>History shows occasional single-sweep spikes in the log</td>
+  <td>Normal: raw sweeps sample µs-scale jitter (a few % scatter, ~3% of
+  sweeps spike). The reported/displayed median is spike-free; both are in
+  the log (section 8.1).</td></tr>
+</table>
+
+<!-- ==================================================== 12 MAINTENANCE -->
+<h1>12&nbsp;&nbsp;Maintenance, tests &amp; specifications</h1>
+<h2>Housekeeping</h2>
+<ul>
+<li><b>Logs grow</b>: live mode writes several rows per second
+    (~a few MB per hour). Old <code>logs\session_*.csv</code> files can be archived
+    or deleted freely; the app never re-reads them.</li>
+<li><b>Reset the configuration</b>: delete <code>settings.json</code> (next to the
+    program) to return every persisted control to its default.</li>
+<li><b>Update the software</b>: <code>git pull</code> in
+    <code>C:\linewidthmeasurement</code>. Every push to the repository runs the
+    analysis self-test in CI on Python 3.11–3.13.</li>
+<li><b>Self-test</b>: <code>python test_analysis.py</code> verifies the whole
+    measurement pipeline against a synthetic laser — no hardware needed.</li>
+</ul>
+<h2>File map</h2>
+<table>
+<tr><th>File</th><th>Role</th></tr>
+<tr><td><code>linewidth_live.py</code></td><td>the application (PySide6 + PyQtGraph UI, acquisition thread)</td></tr>
+<tr><td><code>analysis.py</code></td><td>peak finding, FSR self-calibration, Lorentzian fit, uncertainty</td></tr>
+<tr><td><code>sa201b.py</code> / <code>pico5000a.py</code></td><td>SA201B serial driver / PicoScope block-mode driver</td></tr>
+<tr><td><code>capture.py</code></td><td>one-sweep data container</td></tr>
+<tr><td><code>simulator.py</code> + <code>test_analysis.py</code></td><td>synthetic source + self-test (used by CI)</td></tr>
+<tr><td><code>config.py</code></td><td>FSR, resolution, piezo prior, ports, themes</td></tr>
+<tr><td><code>run.bat</code>, <code>icon.ico</code></td><td>launcher (Startup + desktop shortcuts point here)</td></tr>
+<tr><td><code>logs\</code>, <code>exports\</code>, <code>settings.json</code></td><td>session logs &amp; snapshots, exported CSVs, persisted settings (not in git)</td></tr>
+</table>
+<h2>Key specifications</h2>
+<table>
+<tr><th>Parameter</th><th>Value</th></tr>
+<tr><td>FSR / resolution / finesse (SA210)</td><td>10 GHz / ~67 MHz / &gt;150</td></tr>
+<tr><td>Cavity band (current head, SA210-8B)</td><td>820–1275 nm</td></tr>
+<tr><td>Piezo response (nominal, soft prior only)</td><td>~10 V per FSR at 1064 nm, scales with λ</td></tr>
+<tr><td>Ramp</td><td>1–30 V, 0–15 V offset, 10–100 ms × 1–100 expansion, sawtooth (triangle in Align)</td></tr>
+<tr><td>Trigger</td><td>SA201B TRIGGER OUT, 5 V TTL, rising edge at 1.5 V on EXT</td></tr>
+<tr><td>Sampling</td><td>0.5 µs default (2 MS/s); 15-bit two-channel, 16-bit single-channel</td></tr>
+<tr><td>Capture window</td><td>sweep time × 1.25 + 2 ms, auto-tracked via MONITOR OUT</td></tr>
+<tr><td>PD amplifier gains</td><td>10k / 100k / 1M V/A (SA201B), auto-managed by default</td></tr>
+<tr><td>Reported value (live)</td><td>median of last 11 sweeps, 1σ uncertainty from fit + calibration + median SE</td></tr>
+</table>
+
+<p style="margin-top:8mm;color:#666;font-size:9pt">
+SA210, SA201B are Thorlabs products; PicoScope is a Pico Technology product —
+consult their manuals for device-level specifications. This manual documents
+the measurement application (MIT license) at
+github.com/alextishinin/linewidth-measurement.</p>
+
+</body>
+</html>
