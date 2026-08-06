@@ -1,5 +1,6 @@
 numpy
 scipy
-matplotlib
+PySide6
+pyqtgraph
 pyserial
 picosdk

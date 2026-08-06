@@ -4,10 +4,12 @@ Chain: laser -> SA210 Fabry-Perot -> SA201B controller -> PicoScope 5242D -> her
 
 Run:  python linewidth_live.py   (or run.bat)
 
-Drag with the left mouse button on any graph to zoom into that region
-(auto-scaling pauses for that graph until you press its "reset view" button).
+UI: PySide6 + pyqtgraph. Drag with the left mouse button on any graph to
+zoom into that box (auto-ranging pauses for that graph until its reset
+button, or the v key, restores it). Scroll wheel zooms; dragging an axis
+zooms that axis only.
 
-Keys in the plot window (ignored while typing in the wavelength box):
+Keys (ignored while typing in an input box):
   r  run one sweep (single mode)      m  toggle live/single mode
   g  cycle PD amplifier gain          a  toggle auto-gain
   e  export displayed data to CSV    s  snapshot (PNG + raw CSV)
@@ -28,14 +30,17 @@ import threading
 import time
 
 import numpy as np
+from PySide6 import QtCore, QtGui, QtWidgets
+import pyqtgraph as pg
 
-import config
 import analysis as ana
+import config
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(HERE, "logs")
 EXPORT_DIR = os.path.join(HERE, "exports")
 SETTINGS_PATH = os.path.join(HERE, "settings.json")
+ICON_PATH = os.path.join(HERE, "icon.ico")
 
 
 def _ms_to_step(ms: float) -> int:
@@ -100,26 +105,6 @@ def _is_ctrl_error(exc) -> bool:
     except Exception:
         pass
     return isinstance(exc, OSError)
-
-
-def _decimate_envelope(x, y, max_bins: int = 1200):
-    """Reduce a trace to a min/max envelope for fast plotting.
-
-    Rendering 20k+ points per frame is what makes the whole UI lag; two
-    points (bin min and max) per bin preserves every peak and the noise
-    floor exactly as the eye would see them at screen resolution.
-    """
-    n = len(x)
-    if n <= 2 * max_bins:
-        return x, y
-    stride = n // max_bins
-    m = (n // stride) * stride
-    yb = y[:m].reshape(-1, stride)
-    xs = np.repeat(x[:m].reshape(-1, stride).mean(axis=1), 2)
-    ys = np.empty(2 * (m // stride), dtype=y.dtype)
-    ys[0::2] = yb.min(axis=1)
-    ys[1::2] = yb.max(axis=1)
-    return xs, ys
 
 
 # --------------------------------------------------------------------- setup
@@ -380,9 +365,28 @@ class Acquirer(threading.Thread):
         return (ts_newest, avg)
 
 
+# -------------------------------------------------------------------- window
+class MainWindow(QtWidgets.QWidget):
+    """Top-level window; delegates keys and the close event to the app."""
+
+    def __init__(self, app_logic):
+        super().__init__()
+        self._app = app_logic
+
+    def keyPressEvent(self, ev):
+        if not self._app._on_key(ev.key()):
+            super().keyPressEvent(ev)
+
+    def closeEvent(self, ev):
+        self._app._cleanup()
+        ev.accept()
+
+
 # ---------------------------------------------------------------------- app
 class LiveApp:
     GAIN_NAMES = {0: "10k V/A", 1: "100k V/A", 2: "1M V/A"}
+    GAIN_LABELS = ["Auto", "10k", "100k", "1M"]
+    PLOTS = ("sweep", "peak", "trend")
 
     def __init__(self, args):
         resolve_args(args)               # idempotent; covers direct callers
@@ -395,11 +399,8 @@ class LiveApp:
         self._last_single_stamp = None
         self.wavelength_nm = float(args.wavelength_nm)
         self.theme_name = args.theme
-        self._box_guard = False
         self._manual_gain_idx = 0 if args.pdgain == "auto" else int(args.pdgain)
         self.align_mode = False
-        # graph 2 x-range: "auto" (fit-driven), "full" (one whole FSR), or
-        # "manual" (user min/max, clamped to +-FSR/2)
         self.zoom_span_mode = getattr(args, "span_mode", None) or "auto"
         self.zoom_span_manual = tuple(getattr(args, "span_manual", None)
                                       or (-1000.0, 1000.0))
@@ -409,27 +410,25 @@ class LiveApp:
         self.scan_sweep_ms = (config.RISETIME_MIN_S * 1e3 +
                               args.risetime_step / config.RISETIME_STEPS * span_ms)
         self.scan_expand_idx = int(args.sweep_expand)
+
         self.ctrl, self.scope, self.rise_s = open_hardware(args)
         self.acq = self._new_acquirer()
+
         # auto_gain is user *intent*; a missing controller only gates its
         # effect, so intent survives USB dropouts and reconnects
         self.auto_gain = args.pdgain == "auto"
         self._ctrl_retry_at = 0.0
         self._ctrl_reconnecting = False
         self._ctrl_restored = False
-        # controller writes take ~0.5 s over serial (set + verify); they run
-        # on this worker so button clicks and text boxes respond instantly
         self._ctrl_q = queue.Queue()
         self._ctrl_err = None            # (message, monotonic time)
         threading.Thread(target=self._ctrl_worker, daemon=True).start()
         self._fsr_hist = collections.deque(maxlen=20)
         self._last_err_hz = None
         self._prev_fit_center = None     # sticky peak tracking across sweeps
-        # Single sweeps sample the laser's jitter during the ~us peak
-        # transit, so individual widths scatter by a few percent; the rolling
-        # median is the honest steady-state number in live mode.
         self._lw_recent = collections.deque(maxlen=max(1, args.median))
         self._lw_scatter_hz = None
+        self._disp_lw_hz = None
         self._gain_cooldown_until = 0.0
         # cached copy of the SA201B gain index -- querying the device takes
         # ~100 ms of serial I/O, far too slow for the per-frame UI path
@@ -440,6 +439,8 @@ class LiveApp:
         self.t_start = time.time()
         self.last_result = None
         self._last_processed = None
+        self._cleaned_up = False
+
         self.log_path = None
         self._log_file = None
         self._log_writer = None
@@ -456,7 +457,7 @@ class LiveApp:
                  "peak_v", "n_modes", "pd_gain_index", "wavelength_nm",
                  "linewidth_pm", "linewidth_err_hz", "transverse_frac",
                  "flags"])
-        self._build_figure()
+        self._build_ui()
 
     def _new_acquirer(self) -> Acquirer:
         a = self.args
@@ -464,577 +465,337 @@ class LiveApp:
                         None if a.window_ms is None else a.window_ms / 1e3,
                         a.avg, continuous=(self.mode == "live"))
 
-    # ------------------------------------------------------------- figure
-    def _build_figure(self):
-        import matplotlib
-        matplotlib.use("TkAgg")
-        import matplotlib.pyplot as plt
-        self.plt = plt
-        plt.rcParams.update({
-            "figure.facecolor": config.COL_PAGE,
-            "axes.facecolor": config.COL_SURFACE,
-            "axes.edgecolor": config.COL_AXIS,
-            "axes.labelcolor": config.COL_INK2,
-            "axes.titlecolor": config.COL_INK,
-            "axes.grid": True,
-            "grid.color": config.COL_GRID,
-            "grid.linewidth": 0.8,
-            "xtick.color": config.COL_MUTED,
-            "ytick.color": config.COL_MUTED,
-            "xtick.labelcolor": config.COL_INK2,
-            "ytick.labelcolor": config.COL_INK2,
-            "font.family": "sans-serif",
-            "font.sans-serif": ["Segoe UI", "Arial", "DejaVu Sans"],
-            # keep matplotlib's built-in shortcuts off our keys
-            "keymap.grid": [],
-            "keymap.pan": [],
-            "keymap.save": ["ctrl+s"],
-        })
-        self.fig, (self.ax_sweep, self.ax_zoom, self.ax_trend) = plt.subplots(
-            3, 1, figsize=(11.8, 8.4), height_ratios=[1.1, 1.7, 1.0])
-        if self.fig.canvas.manager is not None:
-            self.fig.canvas.manager.set_window_title("SA210 laser linewidth")
-            try:    # dedicated-station default: start maximized ('f' = fullscreen)
-                self.fig.canvas.manager.window.state("zoomed")
-            except Exception:
-                pass
-        self.fig.subplots_adjust(left=0.075, right=0.70, top=0.94,
-                                 bottom=0.075, hspace=0.52)
-        for ax in (self.ax_sweep, self.ax_zoom, self.ax_trend):
-            for side in ("top", "right"):
-                ax.spines[side].set_visible(False)
+    # -------------------------------------------------------------------- ui
+    def _build_ui(self):
+        self._qapp = QtWidgets.QApplication.instance() \
+            or QtWidgets.QApplication(sys.argv)
+        pg.setConfigOptions(antialias=True)
 
-        self.ax_sweep.set_title("Full sweep (photodiode amplifier out)",
-                                loc="left", fontsize=10)
-        self.ax_sweep.set_xlabel("time along ramp (ms)", fontsize=9)
-        self.ax_sweep.set_ylabel("signal (V)", fontsize=9)
-        (self.ln_sweep,) = self.ax_sweep.plot(
-            [], [], color=config.COL_SERIES1, lw=1.0)
-        (self.mk_peaks,) = self.ax_sweep.plot(
-            [], [], linestyle="none", marker="v", ms=6,
-            markerfacecolor="none", markeredgecolor=config.COL_MUTED)
+        self.win = MainWindow(self)
+        self.win.setWindowTitle("SA210 laser linewidth")
+        if os.path.exists(ICON_PATH):
+            self.win.setWindowIcon(QtGui.QIcon(ICON_PATH))
 
-        self.ax_zoom.set_title("Main peak, frequency calibrated", loc="left",
-                               fontsize=10)
-        self.ax_zoom.set_xlabel("optical frequency offset (MHz)", fontsize=9)
-        self.ax_zoom.set_ylabel("signal (V)", fontsize=9)
-        (self.ln_zoom,) = self.ax_zoom.plot(
-            [], [], color=config.COL_SERIES1, lw=1.6, label="measured")
-        (self.ln_fit,) = self.ax_zoom.plot(
-            [], [], color=config.COL_SERIES2, lw=2.0, ls="--",
-            label="Lorentzian fit")
-        self.ax_zoom.legend(loc="upper right", frameon=False, fontsize=9,
-                            labelcolor=config.COL_INK2)
+        root = QtWidgets.QHBoxLayout(self.win)
+        root.setContentsMargins(8, 8, 8, 8)
 
-        self.ax_trend.set_title("Linewidth (FWHM) history", loc="left",
-                                fontsize=10)
-        self.ax_trend.set_xlabel("elapsed time (s)", fontsize=9)
-        self.ax_trend.set_ylabel("FWHM (MHz)", fontsize=9)
-        (self.ln_trend,) = self.ax_trend.plot(
-            [], [], color=config.COL_SERIES1, lw=1.4, marker="o", ms=2.5,
-            markerfacecolor=config.COL_SERIES1)
+        def make_edit(initial, handler, width=70):
+            ed = QtWidgets.QLineEdit(initial)
+            ed.setFixedWidth(width)
+            ed.editingFinished.connect(lambda: handler(ed.text()))
+            return ed
 
-        # --- drag-to-zoom state (works while data keeps streaming) ---------
-        from matplotlib.patches import Rectangle
-        self._zoom_axes = (self.ax_sweep, self.ax_zoom, self.ax_trend)
-        # per axis AND per dimension, so a wide flat drag zooms x only
-        self._user_zoom = {(id(a), d): False
-                           for a in self._zoom_axes for d in ("x", "y")}
-        self._auto_lims = {}       # what auto-scaling wants, for "reset view"
-        self._drag = None
-        self._zoom_rect = {}
-        for ax in self._zoom_axes:
-            rect = Rectangle((0, 0), 0, 0, visible=False, animated=True,
-                             facecolor=config.COL_SERIES1, alpha=0.20,
-                             edgecolor=config.COL_SERIES1, lw=1.0, zorder=5)
-            ax.add_patch(rect)
-            self._zoom_rect[id(ax)] = rect
-
-        x0 = 0.725
-        self.txt_head = self.fig.text(x0, 0.90, "—", fontsize=26,
-                                      color=config.COL_INK, fontweight="bold")
-        self.txt_sub = self.fig.text(x0, 0.865, "", fontsize=10,
-                                     color=config.COL_INK2)
-        self.txt_status = self.fig.text(x0, 0.835, "", fontsize=9.0,
-                                        color=config.COL_CRITICAL, va="top",
-                                        wrap=True)
-        self.txt_stats = self.fig.text(x0, 0.755, "", fontsize=9.5,
-                                       color=config.COL_INK2, va="top",
-                                       linespacing=1.5)
-        from matplotlib.widgets import Button, TextBox
-
-        class _PatchedTextBox(TextBox):
-            # matplotlib 3.11 bug: TextBox._resize is wrapped by a decorator
-            # that expects mouse events, so plain ResizeEvents (no .inaxes)
-            # raise AttributeError on every window resize. An undecorated
-            # override restores the intended stop-typing behavior -- but
-            # ONLY while typing: stop_typing() ends in an unconditional full
-            # canvas.draw(), and Tk's periodic DPI check fires ResizeEvents
-            # constantly, which otherwise costs a ~230 ms redraw per box
-            # every couple of seconds forever.
-            def _resize(self, event):
-                if self.capturekeystrokes:
-                    self.stop_typing()
-
-        def _style(widget, wax):
-            widget.label.set_fontsize(9)
-            widget.label.set_color(config.COL_INK)
-            for spine in wax.spines.values():
-                spine.set_color(config.COL_AXIS)
-
-        def _make_box(x, y, w, label, initial, callback, h=0.042):
-            bax = self.fig.add_axes([x, y, w, h])
-            box = _PatchedTextBox(bax, label, initial=initial,
-                                  color=config.COL_SURFACE,
-                                  hovercolor="#edece6")
-            box.label.set_fontsize(8.5)
-            box.label.set_color(config.COL_INK2)
-            box.text_disp.set_fontsize(9)
-            box.text_disp.set_color(config.COL_INK)
-            for spine in bax.spines.values():
-                spine.set_color(config.COL_AXIS)
-            box.on_submit(callback)
-            return box
-
-        self.box_wavelength = _make_box(
-            x0 + 0.14, 0.375, 0.07, "λ nm (100–5000)  ",
-            f"{self.wavelength_nm:g}", self._on_wavelength)
-        self.box_amplitude = _make_box(
-            x0 + 0.075, 0.317, 0.04, "ampl V (1–30) ",
-            f"{self.scan_amplitude:g}", self._on_amplitude_box)
-        self.box_offset = _make_box(
-            x0 + 0.20, 0.317, 0.04, "offs V (0–15) ",
-            f"{self.scan_offset:g}", self._on_offset_box)
-        self.box_sweep = _make_box(
-            x0 + 0.095, 0.259, 0.04, "sweep ms (10–100) ",
-            f"{self.scan_sweep_ms:g}", self._on_sweep_box)
-
-        self.EXPAND_LABELS = [f"{f}×" for f in config.SWEEP_EXPANSION_FACTORS]
-        self.combo_expand = self._add_combo(
-            x0 + 0.155, 0.259, 0.085, self.EXPAND_LABELS,
-            self._on_expand_combo)
-        self.txt_expand_label = self.fig.text(
-            x0 + 0.152, 0.312, "expand", fontsize=7.5,
-            color=config.COL_MUTED, va="top")
-
-        self.GAIN_LABELS = ["Auto", "10k", "100k", "1M"]
-        self.txt_gain_label = self.fig.text(
-            x0, 0.2225, "PD gain (V/A)", fontsize=9,
-            color=config.COL_INK2, va="center")
-        self.combo_gain = self._add_combo(
-            x0 + 0.115, 0.201, 0.125, self.GAIN_LABELS, self._on_gain_combo)
-
-        ax_run = self.fig.add_axes([x0, 0.143, 0.115, 0.045])
-        ax_mode = self.fig.add_axes([x0 + 0.125, 0.143, 0.115, 0.045])
-        self.btn_run = Button(ax_run, "Run once", color=config.COL_SURFACE,
-                              hovercolor="#edece6")
-        self.btn_mode = Button(ax_mode, "", color=config.COL_SURFACE,
-                               hovercolor="#edece6")
-        _style(self.btn_run, ax_run)
-        _style(self.btn_mode, ax_mode)
-        self.btn_run.on_clicked(self._on_run_once)
-        self.btn_mode.on_clicked(self._on_toggle_mode)
-
-        ax_exp = self.fig.add_axes([x0, 0.085, 0.115, 0.045])
-        self.btn_export = Button(ax_exp, "Export data",
-                                 color=config.COL_SURFACE,
-                                 hovercolor="#edece6")
-        _style(self.btn_export, ax_exp)
-        self.btn_export.on_clicked(self._on_export)
-        ax_align = self.fig.add_axes([x0 + 0.125, 0.085, 0.115, 0.045])
-        self.btn_align = Button(ax_align, "Align: off",
-                                color=config.COL_SURFACE,
-                                hovercolor="#edece6")
-        _style(self.btn_align, ax_align)
-        self.btn_align.on_clicked(self._on_toggle_align)
-
-        ax_theme = self.fig.add_axes([x0 + 0.185, 0.952, 0.055, 0.038])
-        self.btn_theme = Button(ax_theme, "", color=config.COL_SURFACE,
-                                hovercolor="#edece6")
-        _style(self.btn_theme, ax_theme)
-        self.btn_theme.on_clicked(self._on_toggle_theme)
-
-        # one "reset view" button per graph, tucked above its top-right corner
-        self._reset_buttons = {}
-        for ax in self._zoom_axes:
-            pos = ax.get_position()
-            bax = self.fig.add_axes([pos.x1 - 0.068, pos.y1 + 0.007,
-                                     0.068, 0.026])
-            b = Button(bax, "reset view", color=config.COL_SURFACE,
-                       hovercolor="#edece6")
-            _style(b, bax)
-            b.label.set_fontsize(7.5)
-            b.on_clicked(lambda _e, a=ax: self._reset_view(a))
-            self._reset_buttons[id(ax)] = b
-
-        # graph 2 x-range controls, on the same row as its reset button
-        zpos = self.ax_zoom.get_position()
-        zy = zpos.y1 + 0.007
+        # ---- x-range controls (live beside graph 2) ---------------------
         half = self.fsr_hz / 2e6
-        self.txt_span_label = self.fig.text(
-            0.283, zy + 0.019,
-            f"x-range (MHz, −{half:g}…{half:g}):", fontsize=7.5,
-            color=config.COL_MUTED, va="center")
         self.SPAN_LABELS = ["Auto", f"Full {self.args.fsr_ghz:g} GHz",
                             "Manual"]
-        self.combo_span = self._add_combo(0.400, zy, 0.085, self.SPAN_LABELS,
-                                          self._on_span_combo)
-        self.box_span_min = _make_box(0.507, zy, 0.038, "min ",
-                                      f"{self.zoom_span_manual[0]:g}",
-                                      self._on_span_min, h=0.026)
-        self.box_span_max = _make_box(0.567, zy, 0.038, "max ",
-                                      f"{self.zoom_span_manual[1]:g}",
-                                      self._on_span_max, h=0.026)
-        for b in (self.box_span_min, self.box_span_max):
-            b.label.set_fontsize(7.5)
-            b.text_disp.set_fontsize(8)
+        self.combo_span = QtWidgets.QComboBox()
+        self.combo_span.addItems(self.SPAN_LABELS)
+        self.combo_span.activated.connect(
+            lambda i: self._on_span_combo(self.SPAN_LABELS[i]))
+        self.ed_span_min = make_edit(f"{self.zoom_span_manual[0]:g}",
+                                     self._on_span_min, 56)
+        self.ed_span_max = make_edit(f"{self.zoom_span_manual[1]:g}",
+                                     self._on_span_max, 56)
+        self.lbl_span = QtWidgets.QLabel(f"x-range (±{half:g} MHz)")
 
-        for evt, cb in (("button_press_event", self._on_zoom_press),
-                        ("motion_notify_event", self._on_zoom_motion),
-                        ("button_release_event", self._on_zoom_release)):
-            self.fig.canvas.mpl_connect(evt, cb)
+        # ---- plots, each with a header bar holding its own controls -----
+        self.lbl_titles = {}
+        self.btns_reset = {}
+        left = QtWidgets.QVBoxLayout()
+        left.setSpacing(4)
+
+        def plot_block(name, title, extra=()):
+            header = QtWidgets.QHBoxLayout()
+            lbl = QtWidgets.QLabel(title)
+            self.lbl_titles[name] = lbl
+            header.addWidget(lbl)
+            header.addStretch(1)
+            for w in extra:
+                header.addWidget(w)
+            btn = QtWidgets.QPushButton("reset view")
+            btn.setFixedWidth(88)
+            btn.clicked.connect(lambda _c=False, n=name: self._reset_view(n))
+            self.btns_reset[name] = btn
+            header.addWidget(btn)
+            pw = pg.PlotWidget()
+            block = QtWidgets.QVBoxLayout()
+            block.setSpacing(2)
+            block.addLayout(header)
+            block.addWidget(pw)
+            return block, pw
+
+        blk, self.p_sweep = plot_block(
+            "sweep", "Full sweep (photodiode amplifier out)")
+        left.addLayout(blk, stretch=11)
+        blk, self.p_peak = plot_block(
+            "peak", "Main peak, frequency calibrated",
+            (self.lbl_span, self.combo_span,
+             self.ed_span_min, self.ed_span_max))
+        left.addLayout(blk, stretch=17)
+        blk, self.p_trend = plot_block(
+            "trend", "Linewidth (FWHM) history")
+        left.addLayout(blk, stretch=10)
+        root.addLayout(left, stretch=1)
+        self._plots = {"sweep": self.p_sweep, "peak": self.p_peak,
+                       "trend": self.p_trend}
+
+        self.p_sweep.setLabel("bottom", "time along ramp (ms)")
+        self.p_sweep.setLabel("left", "signal (V)")
+        self.p_peak.setLabel("bottom", "optical frequency offset (MHz)")
+        self.p_peak.setLabel("left", "signal (V)")
+        self.p_trend.setLabel("bottom", "elapsed time (s)")
+        self.p_trend.setLabel("left", "FWHM (MHz)")
+        for p in (self.p_sweep, self.p_peak, self.p_trend):
+            for axname in ("left", "bottom"):
+                # units are spelled out in the labels; no "(x0.001)" scaling
+                p.getAxis(axname).enableAutoSIPrefix(False)
+
+        self._legend = self.p_peak.addLegend(offset=(-10, 8))
+        self.ln_sweep = self.p_sweep.plot()
+        self.mk_peaks = pg.ScatterPlotItem(symbol="t", size=9,
+                                           brush=None)
+        self.p_sweep.addItem(self.mk_peaks)
+        self.ln_zoom = self.p_peak.plot(name="measured")
+        self.ln_fit = self.p_peak.plot(name="Lorentzian fit")
+        self.ln_trend = self.p_trend.plot(symbol="o", symbolSize=4,
+                                          symbolPen=None)
+        for curve in (self.ln_sweep, self.ln_zoom):
+            curve.setDownsampling(auto=True, method="peak")
+            curve.setClipToView(True)
+
+        self._user_zoom = {n: False for n in self.PLOTS}
+        self._auto_range = {}
+        for name, p in self._plots.items():
+            vb = p.getViewBox()
+            vb.setMouseMode(pg.ViewBox.RectMode)
+            p.hideButtons()
+            p.showGrid(x=True, y=True, alpha=0.25)
+            vb.sigRangeChangedManually.connect(
+                lambda _mask, n=name: self._on_manual_zoom(n))
+
+        # ---- side panel -------------------------------------------------
+        side = QtWidgets.QVBoxLayout()
+        side.setSpacing(6)
+        panel = QtWidgets.QWidget()
+        panel.setLayout(side)
+        panel.setFixedWidth(360)
+        root.addWidget(panel)
+
+        top_row = QtWidgets.QHBoxLayout()
+        self.lbl_head = QtWidgets.QLabel("—")
+        f = self.lbl_head.font()
+        f.setPointSize(22)
+        f.setBold(True)
+        self.lbl_head.setFont(f)
+        top_row.addWidget(self.lbl_head, stretch=1)
+        self.btn_theme = QtWidgets.QPushButton("")
+        self.btn_theme.setFixedWidth(64)
+        self.btn_theme.clicked.connect(self._on_toggle_theme)
+        top_row.addWidget(self.btn_theme,
+                          alignment=QtCore.Qt.AlignmentFlag.AlignTop)
+        side.addLayout(top_row)
+
+        self.lbl_sub = QtWidgets.QLabel("")
+        self.lbl_sub.setWordWrap(True)
+        side.addWidget(self.lbl_sub)
+        self.lbl_status = QtWidgets.QLabel("")
+        self.lbl_status.setWordWrap(True)
+        side.addWidget(self.lbl_status)
+        self.lbl_stats = QtWidgets.QLabel("")
+        self.lbl_stats.setWordWrap(True)
+        self.lbl_stats.setTextInteractionFlags(
+            QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        side.addWidget(self.lbl_stats)
+        side.addStretch(1)
+
+        def add_row(*widgets):
+            row = QtWidgets.QHBoxLayout()
+            for w in widgets:
+                row.addWidget(w)
+            side.addLayout(row)
+            return row
+
+        lam_lbl = QtWidgets.QLabel("laser λ nm (100–5000)")
+        self.ed_wavelength = make_edit(f"{self.wavelength_nm:g}",
+                                       self._on_wavelength)
+        add_row(lam_lbl, self.ed_wavelength)
+
+        self.ed_amplitude = make_edit(f"{self.scan_amplitude:g}",
+                                      self._on_amplitude_box, 56)
+        self.ed_offset = make_edit(f"{self.scan_offset:g}",
+                                   self._on_offset_box, 56)
+        add_row(QtWidgets.QLabel("ampl V (1–30)"), self.ed_amplitude,
+                QtWidgets.QLabel("offs V (0–15)"), self.ed_offset)
+
+        self.ed_sweep = make_edit(f"{self.scan_sweep_ms:g}",
+                                  self._on_sweep_box, 56)
+        self.EXPAND_LABELS = [f"{f}×" for f in config.SWEEP_EXPANSION_FACTORS]
+        self.combo_expand = QtWidgets.QComboBox()
+        self.combo_expand.addItems(self.EXPAND_LABELS)
+        self.combo_expand.activated.connect(
+            lambda i: self._on_expand_combo(self.EXPAND_LABELS[i]))
+        add_row(QtWidgets.QLabel("sweep ms (10–100)"), self.ed_sweep,
+                QtWidgets.QLabel("expand"), self.combo_expand)
+
+        self.combo_gain = QtWidgets.QComboBox()
+        self.combo_gain.addItems(self.GAIN_LABELS)
+        self.combo_gain.activated.connect(
+            lambda i: self._on_gain_combo(self.GAIN_LABELS[i]))
+        add_row(QtWidgets.QLabel("PD gain (V/A)"), self.combo_gain)
+
+        self.btn_run = QtWidgets.QPushButton("Run once")
+        self.btn_run.clicked.connect(self._on_run_once)
+        self.btn_mode = QtWidgets.QPushButton("")
+        self.btn_mode.clicked.connect(self._on_toggle_mode)
+        add_row(self.btn_run, self.btn_mode)
+        self.btn_export = QtWidgets.QPushButton("Export data")
+        self.btn_export.clicked.connect(self._on_export)
+        self.btn_align = QtWidgets.QPushButton("Align: off")
+        self.btn_align.clicked.connect(self._on_toggle_align)
+        add_row(self.btn_export, self.btn_align)
+
+        self.lbl_keys = QtWidgets.QLabel(
+            "r run · m mode · t align · g gain · a auto\n"
+            "e export · s snap · d theme · v reset views\n"
+            "p pause · q quit · drag on a graph to zoom")
+        side.addWidget(self.lbl_keys)
 
         self._sync_mode_button()
         self._sync_gain_combo()
         self._sync_expand_combo()
         self._sync_span_widgets()
-        self.txt_keys = self.fig.text(
-            x0, 0.045,
-            "r run · m mode · t align · g gain · a auto\n"
-            "e export · s snap · d theme · v reset views\n"
-            "p pause · q quit   ·   drag on a graph to zoom",
-            fontsize=8, color=config.COL_MUTED, va="top")
-        self.fig.canvas.mpl_connect("key_press_event", self._on_key)
         if self.mode == "single":
-            self.txt_stats.set_text('single mode — press "Run once" (or r)\n'
-                                    "to capture a sweep")
-
-        # Blitting: the full figure takes >100 ms to draw, which is what made
-        # the UI lag. Dynamic artists are marked animated and blitted over a
-        # cached background; a full draw happens only when axis limits move.
-        # txt_stats deliberately NOT animated: its ~14-line layout costs
-        # ~37 ms per draw (vs 1.5 ms for a one-liner), so it lives in the
-        # cached background and is re-baked at most every few seconds.
-        self._animated = [self.ln_sweep, self.mk_peaks, self.ln_zoom,
-                          self.ln_fit, self.ln_trend, self.txt_head,
-                          self.txt_sub, self.txt_status,
-                          *self._zoom_rect.values()]
-        for a in self._animated:
-            a.set_animated(True)
-        # Widget axes are re-drawn from live state on every blit; otherwise a
-        # blit restores the cached background and wipes hover highlights the
-        # instant a new sweep is rendered.
-        self._theme_buttons = [self.btn_run, self.btn_mode, self.btn_export,
-                               self.btn_align, self.btn_theme,
-                               *self._reset_buttons.values()]
-        self._theme_boxes = [self.box_wavelength, self.box_amplitude,
-                             self.box_offset, self.box_sweep,
-                             self.box_span_min, self.box_span_max]
-        self._widget_axes = [w.ax for w in
-                             (*self._theme_buttons, *self._theme_boxes)]
-        # hover bookkeeping: only the widget under the cursor (plus the one
-        # whose hover state may be baked into the background) gets redrawn
-        # per blit -- redrawing all 14 cost ~30 ms/frame
-        self._widget_ax_set = set(self._widget_axes)
-        self._hover_ax = None
-        self._bg_hover_ax = None
-        self._stats_baked_at = 0.0
-        self._shown_vals = {}
-        self._bg = None
-        self.fig.canvas.mpl_connect("draw_event", self._on_draw)
-        self.fig.canvas.mpl_connect("motion_notify_event", self._on_hover)
+            self.lbl_stats.setText('single mode — press "Run once" (or r) '
+                                   "to capture a sweep")
         self._apply_theme(self.theme_name)
         self._sync_theme_button()
 
-    def _on_hover(self, event):
-        ax = event.inaxes
-        self._hover_ax = ax if ax in self._widget_ax_set else None
-
-    def _shown(self, key, value, quantum):
-        """Display hysteresis: the shown value moves only when the live one
-        drifts a full quantum away, so quantized stats strings don't chatter
-        on rounding boundaries (every chatter costs a ~250 ms re-bake)."""
-        if value is None:
-            self._shown_vals.pop(key, None)
-            return None
-        shown = self._shown_vals.get(key)
-        if shown is None or abs(value - shown) >= quantum:
-            self._shown_vals[key] = value
-            shown = value
-        return shown
-
-    def _on_draw(self, _event):
-        """After any full draw: cache the background, re-add dynamic artists."""
-        self._bg = self.fig.canvas.copy_from_bbox(self.fig.bbox)
-        self._bg_hover_ax = self._hover_ax   # this hover state is baked in
-        self._stats_baked_at = time.monotonic()
-        self._stats_shown = self.txt_stats.get_text()
-        for a in self._animated:
-            self.fig.draw_artist(a)
-
-    def _lim(self, ax, axis, lo, hi, exact=False):
-        """Set axis limits only when actually needed; returns True if changed.
-
-        Hysteresis (grow at once, shrink only when data uses <55% of the
-        range) keeps limits — and therefore the cached background — stable.
-        An axis the user has zoomed into is left alone: the target is only
-        recorded, so "reset view" knows where to go back to.
-        """
-        key = (id(ax), axis)
-        cur = ax.get_xlim() if axis == "x" else ax.get_ylim()
-        if not exact:
-            span = hi - lo
-            if span <= 0:
-                return False
-            lo_pad, hi_pad = lo - 0.1 * span, hi + 0.1 * span
+    # ----------------------------------------------------------- keys/zoom
+    def _on_key(self, key) -> bool:
+        K = QtCore.Qt.Key
+        if key == K.Key_Q:
+            self.win.close()
+        elif key == K.Key_P:
+            self.paused = not self.paused
+        elif key == K.Key_R:
+            self._on_run_once()
+        elif key == K.Key_M:
+            self._on_toggle_mode()
+        elif key == K.Key_T:
+            self._on_toggle_align()
+        elif key == K.Key_D:
+            self._on_toggle_theme()
+        elif key == K.Key_S:
+            self._snapshot()
+        elif key == K.Key_E:
+            self._on_export()
+        elif key == K.Key_V:
+            self._reset_all_views()
+        elif key == K.Key_A:
+            if self.ctrl is not None:
+                self.auto_gain = not self.auto_gain
+                if not self.auto_gain:
+                    self._manual_gain_idx = self._gain_cache
+                print(f"[gain] auto-gain {'ON' if self.auto_gain else 'OFF'}")
+                self._sync_gain_combo()
+        elif key == K.Key_G:
+            if self.ctrl is not None:
+                self._apply_gain_choice(((self._gain_cache + 1) % 3) + 1)
+        elif key in (K.Key_Left, K.Key_Right):
+            if self.ctrl is not None:
+                delta = 0.25 if key == K.Key_Right else -0.25
+                new = float(np.clip(self.scan_offset + delta, 0.0, 15.0))
+                self.scan_offset = new
+                self.ed_offset.setText(f"{new:g}")
+                self._ctrl_do(f"DC offset -> {new:.2f} V",
+                              lambda c: setattr(c, "dc_offset_v", new))
         else:
-            lo_pad, hi_pad = lo, hi
-
-        if self._user_zoom.get(key):
-            self._auto_lims[key] = (lo_pad, hi_pad)   # remember, don't apply
             return False
-
-        if exact:
-            if abs(cur[0] - lo) < 1e-12 and abs(cur[1] - hi) < 1e-12:
-                self._auto_lims[key] = cur
-                return False
-        else:
-            # deadband: requests carry their own padding, so tolerating a
-            # few % of drift never clips data -- but it stops noise-level
-            # request creep from regenerating ticks (a ~230 ms full draw)
-            cur_span = cur[1] - cur[0]
-            tol = 0.05 * cur_span
-            inside = lo >= cur[0] - tol and hi <= cur[1] + tol
-            fills = (hi - lo) > 0.55 * cur_span
-            if inside and fills:
-                self._auto_lims[key] = cur
-                return False
-        (ax.set_xlim if axis == "x" else ax.set_ylim)(lo_pad, hi_pad)
-        self._auto_lims[key] = (lo_pad, hi_pad)
         return True
 
-    # ------------------------------------------------------- drag-to-zoom
-    def _toolbar_busy(self) -> bool:
-        tb = getattr(self.fig.canvas, "toolbar", None)
-        return bool(tb is not None and getattr(tb, "mode", ""))
-
-    def _on_zoom_press(self, event):
-        if (event.button != 1 or self._toolbar_busy()
-                or event.inaxes not in self._zoom_axes
-                or event.xdata is None or event.ydata is None):
-            return
-        self._drag = (event.inaxes, event.xdata, event.ydata,
-                      event.x, event.y)
-        rect = self._zoom_rect[id(event.inaxes)]
-        rect.set_bounds(event.xdata, event.ydata, 0, 0)
-        rect.set_visible(True)
-
-    def _on_zoom_motion(self, event):
-        if self._drag is None:
-            return
-        ax, x0, y0, _px, _py = self._drag
-        if event.xdata is None or event.ydata is None:
-            return          # cursor left the axes; keep the last rectangle
-        rect = self._zoom_rect[id(ax)]
-        rect.set_bounds(min(x0, event.xdata), min(y0, event.ydata),
-                        abs(event.xdata - x0), abs(event.ydata - y0))
-        self._blit()        # live rubber band, independent of the data timer
-
-    def _on_zoom_release(self, event):
-        if self._drag is None:
-            return
-        ax, x0, y0, px, py = self._drag
-        self._drag = None
-        self._zoom_rect[id(ax)].set_visible(False)
-        x1 = x0 if event.xdata is None else event.xdata
-        y1 = y0 if event.ydata is None else event.ydata
-        dx_px = abs((event.x if event.x is not None else px) - px)
-        dy_px = abs((event.y if event.y is not None else py) - py)
-
-        # A drag that is wide but flat zooms x only, and vice versa, so you
-        # can rescale one dimension without disturbing the other.
-        MIN_PX = 8
-        zoomed = False
-        if dx_px >= MIN_PX and x1 != x0:
-            ax.set_xlim(min(x0, x1), max(x0, x1))
-            self._user_zoom[(id(ax), "x")] = True
-            zoomed = True
-        if dy_px >= MIN_PX and y1 != y0:
-            ax.set_ylim(min(y0, y1), max(y0, y1))
-            self._user_zoom[(id(ax), "y")] = True
-            zoomed = True
-        if zoomed:
-            print(f"[zoom] {ax.get_title(loc='left') or 'graph'}: "
-                  f"zoomed — auto-scaling paused until reset")
+    def _on_manual_zoom(self, name):
+        if not self._user_zoom[name]:
+            print(f"[zoom] {name}: zoomed — auto-ranging paused until reset")
+        self._user_zoom[name] = True
         self._sync_reset_buttons()
-        self._bg = None                 # ticks changed: rebuild background
-        self.fig.canvas.draw_idle()
 
-    def _reset_view(self, ax, redraw=True):
-        for d in ("x", "y"):
-            key = (id(ax), d)
-            if self._user_zoom.get(key):
-                self._user_zoom[key] = False
-                lims = self._auto_lims.get(key)
-                if lims:
-                    (ax.set_xlim if d == "x" else ax.set_ylim)(*lims)
+    def _reset_view(self, name):
+        self._user_zoom[name] = False
+        rng = self._auto_range.get(name)
+        if rng is not None:
+            vb = self._plots[name].getViewBox()
+            vb.setXRange(*rng[0], padding=0)
+            vb.setYRange(*rng[1], padding=0)
         self._sync_reset_buttons()
-        if redraw:
-            self._bg = None
-            self.fig.canvas.draw_idle()
 
     def _reset_all_views(self):
-        for ax in self._zoom_axes:
-            self._reset_view(ax, redraw=False)
-        self._bg = None
-        self.fig.canvas.draw_idle()
+        for name in self.PLOTS:
+            self._reset_view(name)
 
     def _sync_reset_buttons(self):
-        """Highlight the reset button of every graph that is zoomed."""
-        T = config.THEMES[self.theme_name]
-        for ax in self._zoom_axes:
-            active = any(self._user_zoom.get((id(ax), d))
-                         for d in ("x", "y"))
-            b = self._reset_buttons[id(ax)]
-            face = T["HOVER"] if active else T["SURFACE"]
-            b.color = face
-            b.ax.set_facecolor(face)
-            b.label.set_color(T["INK"] if active else T["MUTED"])
-
-    def _blit(self):
-        """Repaint the dynamic artists over the cached background."""
-        canvas = self.fig.canvas
-        if self._bg is None:
-            canvas.draw()
-            return
-        canvas.restore_region(self._bg)
-        for a in self._animated:
-            self.fig.draw_artist(a)
-        # only widgets whose live state can differ from the background:
-        # the one under the cursor and the one baked while hovered
-        for wax in {self._hover_ax, self._bg_hover_ax} - {None}:
-            self.fig.draw_artist(wax)
-        canvas.blit(self.fig.bbox)
+        for name, b in self.btns_reset.items():
+            f = b.font()
+            f.setBold(self._user_zoom[name])
+            b.setFont(f)
 
     # ---------------------------------------------------------------- theme
-    def _on_toggle_theme(self, _event=None):
+    def _on_toggle_theme(self):
         self.theme_name = "light" if self.theme_name == "dark" else "dark"
         self._apply_theme(self.theme_name)
         self._sync_theme_button()
 
     def _sync_theme_button(self):
         # the button names the theme you would switch TO
-        self.btn_theme.label.set_text(
+        self.btn_theme.setText(
             "Light" if self.theme_name == "dark" else "Dark")
-        self.fig.canvas.draw_idle()
 
     def _apply_theme(self, name):
-        """Repaint every element of the UI in the given palette."""
         T = config.THEMES[name]
-        self.fig.set_facecolor(T["PAGE"])
-        for ax in (self.ax_sweep, self.ax_zoom, self.ax_trend):
-            ax.set_facecolor(T["SURFACE"])
-            for spine in ax.spines.values():
-                spine.set_color(T["AXIS"])
-            ax.tick_params(colors=T["MUTED"], labelcolor=T["INK2"])
-            ax.xaxis.label.set_color(T["INK2"])
-            ax.yaxis.label.set_color(T["INK2"])
-            ax.title.set_color(T["INK"])
-            ax.grid(True, color=T["GRID"], linewidth=0.8)
-        for ln in (self.ln_sweep, self.ln_zoom, self.ln_trend):
-            ln.set_color(T["SERIES1"])
-        self.ln_trend.set_markerfacecolor(T["SERIES1"])
-        self.ln_fit.set_color(T["SERIES2"])
-        self.mk_peaks.set_markeredgecolor(T["MUTED"])
-        self.ax_zoom.legend(loc="upper right", frameon=False, fontsize=9,
-                            labelcolor=T["INK2"])
-        self.txt_head.set_color(T["INK"])
-        self.txt_sub.set_color(T["INK2"])
-        self.txt_stats.set_color(T["INK2"])
-        self.txt_status.set_color(T["CRITICAL"])
-        self.txt_keys.set_color(T["MUTED"])
-        self.txt_gain_label.set_color(T["INK2"])
-        self.txt_expand_label.set_color(T["MUTED"])
-        self.txt_span_label.set_color(T["MUTED"])
-        for b in self._theme_buttons:
-            b.color = T["SURFACE"]
-            b.hovercolor = T["HOVER"]
-            b.ax.set_facecolor(T["SURFACE"])
-            b.label.set_color(T["INK"])
-            for spine in b.ax.spines.values():
-                spine.set_color(T["AXIS"])
-        for rect in self._zoom_rect.values():
-            rect.set_facecolor(T["SERIES1"])
-            rect.set_edgecolor(T["SERIES1"])
-        self._sync_reset_buttons()
-        for box in self._theme_boxes:
-            box.color = T["SURFACE"]
-            box.hovercolor = T["HOVER"]
-            box.ax.set_facecolor(T["SURFACE"])
-            box.label.set_color(T["INK2"])
-            box.text_disp.set_color(T["INK"])
-            try:
-                box.cursor.set_color(T["INK"])
-            except Exception:
-                pass
-            for spine in box.ax.spines.values():
-                spine.set_color(T["AXIS"])
-        self._style_combos(T)
-        self._bg = None                  # cached background is now stale
-        self.fig.canvas.draw_idle()
+        self.win.setStyleSheet(f"""
+            QWidget {{ background-color: {T['PAGE']}; color: {T['INK']}; }}
+            QLineEdit, QComboBox {{
+                background-color: {T['SURFACE']}; color: {T['INK']};
+                border: 1px solid {T['AXIS']}; padding: 2px 4px; }}
+            QComboBox QAbstractItemView {{
+                background-color: {T['SURFACE']}; color: {T['INK']};
+                selection-background-color: {T['SERIES1']};
+                selection-color: #ffffff; }}
+            QPushButton {{
+                background-color: {T['SURFACE']}; color: {T['INK']};
+                border: 1px solid {T['AXIS']}; padding: 5px 10px; }}
+            QPushButton:hover {{ background-color: {T['HOVER']}; }}
+        """)
+        self.lbl_sub.setStyleSheet(f"color: {T['INK2']};")
+        self.lbl_status.setStyleSheet(f"color: {T['CRITICAL']};")
+        self.lbl_stats.setStyleSheet(f"color: {T['INK2']};")
+        self.lbl_keys.setStyleSheet(f"color: {T['MUTED']};")
 
-    def _style_combos(self, T):
-        """Native ttk dropdowns need Tk-level styling (incl. the popup list)."""
-        try:
-            import tkinter.ttk as ttk
-            style = ttk.Style()
-            style.theme_use("clam")      # the only stock theme that obeys
-            style.configure("LW.TCombobox",  # field/arrow color settings
-                            fieldbackground=T["SURFACE"],
-                            background=T["SURFACE"],
-                            foreground=T["INK"],
-                            arrowcolor=T["INK"],
-                            bordercolor=T["AXIS"],
-                            lightcolor=T["SURFACE"],
-                            darkcolor=T["SURFACE"])
-            style.map("LW.TCombobox",
-                      fieldbackground=[("readonly", T["SURFACE"])],
-                      foreground=[("readonly", T["INK"])],
-                      selectbackground=[("readonly", T["SURFACE"])],
-                      selectforeground=[("readonly", T["INK"])])
-            for combo in (self.combo_gain, self.combo_expand):
-                combo.configure(style="LW.TCombobox")
-                pd = combo.tk.call("ttk::combobox::PopdownWindow", combo)
-                combo.tk.call(f"{pd}.f.l", "configure",
-                              "-background", T["SURFACE"],
-                              "-foreground", T["INK"],
-                              "-selectbackground", T["SERIES1"],
-                              "-selectforeground", "#ffffff")
-        except Exception as exc:
-            print(f"[theme] dropdown styling skipped: {exc}")
-
-    def _add_combo(self, x_fig, y_fig, w_fig, values, callback):
-        """Native Tk dropdown overlaid on the canvas at figure coordinates
-        (matplotlib has no combobox; the TkAgg canvas hosts real widgets)."""
-        import tkinter.ttk as ttk
-        tkc = self.fig.canvas.get_tk_widget()
-        combo = ttk.Combobox(tkc, values=values, state="readonly",
-                             font=("Segoe UI", 9))
-        combo.place(relx=x_fig, rely=1.0 - y_fig, relwidth=w_fig, anchor="sw")
-
-        def _selected(_event):
-            callback(combo.get())
-            tkc.focus_set()      # hand the keyboard back to the plot
-        combo.bind("<<ComboboxSelected>>", _selected)
-        return combo
+        for p in self._plots.values():
+            p.setBackground(T["PAGE"])
+            p.getViewBox().setBackgroundColor(T["SURFACE"])
+            for axname in ("left", "bottom"):
+                ax = p.getAxis(axname)
+                ax.setPen(pg.mkPen(T["AXIS"]))
+                ax.setTextPen(pg.mkPen(T["INK2"]))
+        for lbl in self.lbl_titles.values():
+            lbl.setStyleSheet(f"color: {T['INK']}; font-weight: 600;")
+        self.ln_sweep.setPen(pg.mkPen(T["SERIES1"], width=1))
+        self.ln_zoom.setPen(pg.mkPen(T["SERIES1"], width=2))
+        self.ln_fit.setPen(pg.mkPen(T["SERIES2"], width=2,
+                                    style=QtCore.Qt.PenStyle.DashLine))
+        self.ln_trend.setPen(pg.mkPen(T["SERIES1"], width=1.5))
+        self.ln_trend.setSymbolBrush(pg.mkBrush(T["SERIES1"]))
+        self.mk_peaks.setPen(pg.mkPen(T["MUTED"]))
+        if self._legend is not None:
+            self._legend.setLabelTextColor(T["INK2"])
 
     # ---------------------------------------------------------------- modes
     def _sync_mode_button(self):
-        self.btn_mode.label.set_text(
+        self.btn_mode.setText(
             "Mode: Live" if self.mode == "live" else "Mode: Single")
-        self.fig.canvas.draw_idle()
 
-    def _on_run_once(self, _event=None):
+    def _on_run_once(self):
         if self.mode != "single":
             self.mode = "single"
             self.acq.continuous.clear()
@@ -1043,7 +804,7 @@ class LiveApp:
         self._arm_time = time.time()
         self.acq.request_oneshot(self.args.avg)   # scope captures, then idles
 
-    def _on_toggle_mode(self, _event=None):
+    def _on_toggle_mode(self):
         self.mode = "live" if self.mode == "single" else "single"
         if self.mode == "single":
             self._armed = False              # scope idle until Run once
@@ -1052,48 +813,33 @@ class LiveApp:
             self.acq.continuous.set()
         self._sync_mode_button()
 
-    # ------------------------------------------------------------ text boxes
-    def _norm_box(self, box, text):
-        """Rewrite a TextBox without re-triggering its submit callback."""
-        self._box_guard = True
-        try:
-            box.set_val(text)
-        finally:
-            self._box_guard = False
-
-    def _typing(self) -> bool:
-        return any(getattr(b, "capturekeystrokes", False)
-                   for b in self._theme_boxes)
-
+    # ----------------------------------------------------------- wavelength
     def _on_wavelength(self, text):
-        if self._box_guard:
-            return
         try:
             v = float(str(text).strip())
             if not (100.0 <= v <= 5000.0):
                 raise ValueError
-            self.wavelength_nm = v
-            print(f"[λ] wavelength set to {v:g} nm")
+            if v != self.wavelength_nm:
+                self.wavelength_nm = v
+                print(f"[λ] wavelength set to {v:g} nm")
         except ValueError:
-            self.txt_status.set_text(
+            self.lbl_status.setText(
                 f"bad wavelength {text!r} — keeping {self.wavelength_nm:g} nm")
-        self._norm_box(self.box_wavelength, f"{self.wavelength_nm:g}")
+        self.ed_wavelength.setText(f"{self.wavelength_nm:g}")
 
     # ------------------------------------------------- graph 2 x-range
     def _sync_span_widgets(self):
         idx = {"auto": 0, "full": 1, "manual": 2}[self.zoom_span_mode]
-        self.combo_span.set(self.SPAN_LABELS[idx])
-        self._norm_box(self.box_span_min, f"{self.zoom_span_manual[0]:g}")
-        self._norm_box(self.box_span_max, f"{self.zoom_span_manual[1]:g}")
+        self.combo_span.setCurrentIndex(idx)
+        self.ed_span_min.setText(f"{self.zoom_span_manual[0]:g}")
+        self.ed_span_max.setText(f"{self.zoom_span_manual[1]:g}")
 
     def _apply_span_mode(self, mode):
         self.zoom_span_mode = mode
         # an explicit x-range choice supersedes any drag-zoom on that graph
-        self._user_zoom[(id(self.ax_zoom), "x")] = False
+        self._user_zoom["peak"] = False
         self._sync_span_widgets()
         self._sync_reset_buttons()
-        self._bg = None
-        self.fig.canvas.draw_idle()
 
     def _on_span_combo(self, label):
         mode = ("auto", "full", "manual")[self.SPAN_LABELS.index(label)]
@@ -1107,23 +853,22 @@ class LiveApp:
         self._set_span_edge(text, "max")
 
     def _set_span_edge(self, text, which):
-        if self._box_guard:
-            return
         half = self.fsr_hz / 2e6
         lo, hi = self.zoom_span_manual
         try:
             v = float(str(text).strip())
             if not (-half <= v <= half):
                 raise ValueError(f"valid range -{half:g} to {half:g} MHz")
-            lo, hi = (v, hi) if which == "min" else (lo, v)
-            if hi - lo < 1.0:
+            new_lo, new_hi = (v, hi) if which == "min" else (lo, v)
+            if new_hi - new_lo < 1.0:
                 raise ValueError("max must exceed min by at least 1 MHz")
-            self.zoom_span_manual = (lo, hi)
-            print(f"[graph2] x-range {lo:g} .. {hi:g} MHz (manual)")
-            self._apply_span_mode("manual")     # typing implies manual
-            return
+            if (new_lo, new_hi) != self.zoom_span_manual:
+                self.zoom_span_manual = (new_lo, new_hi)
+                print(f"[graph2] x-range {new_lo:g} .. {new_hi:g} MHz (manual)")
+                self._apply_span_mode("manual")     # typing implies manual
+                return
         except Exception as exc:
-            self.txt_status.set_text(f"x-range not set: {exc}")
+            self.lbl_status.setText(f"x-range not set: {exc}")
         self._sync_span_widgets()
 
     # --------------------------------------------------------- scan controls
@@ -1133,40 +878,36 @@ class LiveApp:
         self.acq.request_window(rise * 1.25 + 0.002)
 
     def _no_ctrl_hint(self):
-        self.txt_status.set_text(
+        self.lbl_status.setText(
             "no SA201B USB — set it on the touchscreen (display will follow)")
 
     def _on_amplitude_box(self, text):
-        if self._box_guard:
-            return
         try:
             v = float(str(text).strip())
             if not (1.0 <= v <= 30.0):
                 raise ValueError("valid range 1-30 V")
-            self.scan_amplitude = v
-            self._ctrl_do(f"amplitude -> {v:g} V",
-                          lambda c: setattr(c, "amplitude_v", v))
+            if v != self.scan_amplitude:
+                self.scan_amplitude = v
+                self._ctrl_do(f"amplitude -> {v:g} V",
+                              lambda c: setattr(c, "amplitude_v", v))
         except ValueError as exc:
-            self.txt_status.set_text(f"amplitude not set: {exc}")
-        self._norm_box(self.box_amplitude, f"{self.scan_amplitude:g}")
+            self.lbl_status.setText(f"amplitude not set: {exc}")
+        self.ed_amplitude.setText(f"{self.scan_amplitude:g}")
 
     def _on_offset_box(self, text):
-        if self._box_guard:
-            return
         try:
             v = float(str(text).strip())
             if not (0.0 <= v <= 15.0):
                 raise ValueError("valid range 0-15 V")
-            self.scan_offset = v
-            self._ctrl_do(f"DC offset -> {v:g} V",
-                          lambda c: setattr(c, "dc_offset_v", v))
+            if v != self.scan_offset:
+                self.scan_offset = v
+                self._ctrl_do(f"DC offset -> {v:g} V",
+                              lambda c: setattr(c, "dc_offset_v", v))
         except ValueError as exc:
-            self.txt_status.set_text(f"offset not set: {exc}")
-        self._norm_box(self.box_offset, f"{self.scan_offset:g}")
+            self.lbl_status.setText(f"offset not set: {exc}")
+        self.ed_offset.setText(f"{self.scan_offset:g}")
 
     def _on_sweep_box(self, text):
-        if self._box_guard:
-            return
         lo = config.RISETIME_MIN_S * 1e3
         hi = config.RISETIME_MAX_S * 1e3
         try:
@@ -1174,17 +915,19 @@ class LiveApp:
             if not (lo <= ms <= hi):
                 raise ValueError(f"valid range {lo:g}-{hi:g} ms (at 1x)")
             step = _ms_to_step(ms)
-            self.scan_sweep_ms = lo + step / config.RISETIME_STEPS * (hi - lo)
-            self._push_window()
-            self._ctrl_do(f"sweep -> {self.scan_sweep_ms:g} ms at 1x "
-                          f"(step {step})",
-                          lambda c: setattr(c, "risetime_step", step))
+            achieved = lo + step / config.RISETIME_STEPS * (hi - lo)
+            if achieved != self.scan_sweep_ms:
+                self.scan_sweep_ms = achieved
+                self._push_window()
+                self._ctrl_do(f"sweep -> {self.scan_sweep_ms:g} ms at 1x "
+                              f"(step {step})",
+                              lambda c: setattr(c, "risetime_step", step))
         except ValueError as exc:
-            self.txt_status.set_text(f"sweep time not set: {exc}")
-        self._norm_box(self.box_sweep, f"{self.scan_sweep_ms:g}")
+            self.lbl_status.setText(f"sweep time not set: {exc}")
+        self.ed_sweep.setText(f"{self.scan_sweep_ms:g}")
 
     def _sync_expand_combo(self):
-        self.combo_expand.set(self.EXPAND_LABELS[self.scan_expand_idx])
+        self.combo_expand.setCurrentIndex(self.scan_expand_idx)
 
     def _set_expand(self, idx):
         self.scan_expand_idx = idx
@@ -1198,21 +941,20 @@ class LiveApp:
         self._set_expand(self.EXPAND_LABELS.index(label))
 
     # ------------------------------------------------------- alignment mode
-    def _on_toggle_align(self, _event=None):
+    def _on_toggle_align(self):
         self.align_mode = not self.align_mode
         want_saw = not self.align_mode
         self._ctrl_do("triangle scan (alignment)" if self.align_mode
                       else "sawtooth scan (measurement)",
                       lambda c: setattr(c, "sawtooth", want_saw))
-        self.btn_align.label.set_text(
+        self.btn_align.setText(
             "Align: TRI" if self.align_mode else "Align: off")
-        self.fig.canvas.draw_idle()
 
     # ----------------------------------------------------------------- gain
     def _apply_gain_choice(self, idx):
         """idx 0 = Auto; 1..3 = manual gain index (idx - 1)."""
         if self.ctrl is None:
-            self.txt_status.set_text(
+            self.lbl_status.setText(
                 "SA201B USB not connected — gain control unavailable")
         elif idx == 0:
             self.auto_gain = True
@@ -1231,188 +973,9 @@ class LiveApp:
         self._apply_gain_choice(self.GAIN_LABELS.index(label))
 
     def _sync_gain_combo(self):
-        self.combo_gain.set(
-            "Auto" if (self.auto_gain or self.ctrl is None)
-            else self.GAIN_LABELS[self._manual_gain_idx + 1])
-
-    # --------------------------------------------------------------- export
-    def _on_export(self, _event=None):
-        res = self.last_result
-        if res is None or res.t is None:
-            self.txt_status.set_text("nothing to export yet")
-            return
-        os.makedirs(EXPORT_DIR, exist_ok=True)
-        stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        lam = self.wavelength_nm
-        wrote = []
-
-        sweep_path = os.path.join(EXPORT_DIR, f"sweep_{stamp}.csv")
-        with open(sweep_path, "w", newline="") as fh:
-            fh.write("# SA210 / SA201B / PicoScope 5242D — one sweep\n")
-            fh.write(f"# exported: "
-                     f"{_dt.datetime.now().isoformat(timespec='seconds')}\n")
-            fh.write(f"# wavelength_nm: {lam:g}\n")
-            fh.write(f"# fsr_hz: {self.fsr_hz:g}\n")
-            if res.hz_per_s:
-                fh.write(f"# hz_per_s: {res.hz_per_s:.6g}\n")
-            if res.linewidth_hz:
-                wv, wu = ana.wavelength_width(res.linewidth_hz, lam)
-                fh.write(f"# fwhm_mhz: {res.linewidth_hz / 1e6:.4f}\n")
-                if self._last_err_hz:
-                    fh.write(f"# fwhm_err_mhz_1sigma: "
-                             f"{self._last_err_hz / 1e6:.4f}\n")
-                fh.write(f"# fwhm_wavelength: {wv:.4g} {wu}\n")
-            if res.finesse:
-                fh.write(f"# effective_finesse: {res.finesse:.1f}\n")
-            if res.transverse_frac is not None:
-                fh.write(f"# transverse_frac: {res.transverse_frac:.3f}\n")
-            if self.ctrl is not None:
-                fh.write(f"# pd_gain: {self.GAIN_NAMES[self._gain_cache]}\n")
-            fh.write(f"# mode: {self.mode}\n")
-            w = csv.writer(fh)
-            w.writerow(["time_s", "signal_v", "freq_offset_mhz", "fit_v"])
-            fit_map = {}
-            if res.fit_t is not None:
-                fit_map = {round(float(tt), 12): float(fv)
-                           for tt, fv in zip(res.fit_t, res.fit_v)}
-            calibrated = bool(res.hz_per_s and res.fit_center_s is not None)
-            for tt, vv in zip(res.t, res.v):
-                f_off = (f"{(tt - res.fit_center_s) * res.hz_per_s / 1e6:.6f}"
-                         if calibrated else "")
-                fv = fit_map.get(round(float(tt), 12))
-                w.writerow([f"{tt:.9f}", f"{vv:.6f}", f_off,
-                            "" if fv is None else f"{fv:.6f}"])
-        wrote.append(sweep_path)
-
-        if self.history:
-            hist_path = os.path.join(EXPORT_DIR, f"history_{stamp}.csv")
-            with open(hist_path, "w", newline="") as fh:
-                fh.write(f"# linewidth history — wavelength_nm: {lam:g}\n")
-                w = csv.writer(fh)
-                w.writerow(["iso_time", "elapsed_s", "linewidth_mhz",
-                            "linewidth_pm"])
-                for wall, lw in self.history:
-                    w.writerow([
-                        _dt.datetime.fromtimestamp(wall)
-                        .isoformat(timespec="seconds"),
-                        f"{wall - self.t_start:.2f}",
-                        f"{lw / 1e6:.4f}",
-                        f"{ana.delta_lambda_m(lw, lam) * 1e12:.6f}"])
-            wrote.append(hist_path)
-
-        names = ", ".join(os.path.basename(p) for p in wrote)
-        self.txt_status.set_text(f"exported: {names}")
-        print("[export] " + " | ".join(wrote))
-
-    # ---------------------------------------------------------------- keys
-    def _on_key(self, event):
-        if self._typing():
-            return      # user is typing in one of the input boxes
-        if event.key == "q":
-            self.plt.close(self.fig)
-        elif event.key == "p":
-            self.paused = not self.paused
-        elif event.key == "r":
-            self._on_run_once()
-        elif event.key == "m":
-            self._on_toggle_mode()
-        elif event.key == "t":
-            self._on_toggle_align()
-        elif event.key == "d":
-            self._on_toggle_theme()
-        elif event.key == "v":
-            self._reset_all_views()
-        elif event.key == "s":
-            self._snapshot()
-        elif event.key == "e":
-            self._on_export()
-        elif event.key == "a":
-            if self.ctrl is not None:
-                self.auto_gain = not self.auto_gain
-                if not self.auto_gain:
-                    self._manual_gain_idx = self._gain_cache
-                print(f"[gain] auto-gain {'ON' if self.auto_gain else 'OFF'}")
-                self._sync_gain_combo()
-        elif event.key == "g" and self.ctrl is not None:
-            self._apply_gain_choice(((self._gain_cache + 1) % 3) + 1)
-        elif event.key in ("left", "right") and self.ctrl is not None:
-            delta = 0.25 if event.key == "right" else -0.25
-            new = float(np.clip(self.scan_offset + delta, 0.0, 15.0))
-            self.scan_offset = new
-            self._norm_box(self.box_offset, f"{new:g}")
-            self._ctrl_do(f"DC offset -> {new:.2f} V",
-                          lambda c: setattr(c, "dc_offset_v", new))
-
-    def _snapshot(self):
-        os.makedirs(LOG_DIR, exist_ok=True)
-        stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        png = os.path.join(LOG_DIR, f"snapshot_{stamp}.png")
-        for a in self._animated:     # ensure traces render into the file
-            a.set_animated(False)
-        try:
-            self.fig.savefig(png, dpi=150, facecolor=self.fig.get_facecolor())
-        finally:
-            for a in self._animated:
-                a.set_animated(True)
-            self._bg = None          # print renderer invalidated the cache
-            self.fig.canvas.draw_idle()
-        res = self.last_result
-        if res is not None and res.t is not None:
-            csv_path = os.path.join(LOG_DIR, f"snapshot_{stamp}.csv")
-            with open(csv_path, "w", newline="") as fh:
-                w = csv.writer(fh)
-                w.writerow(["time_s", "signal_v"])
-                w.writerows(zip(res.t, res.v))
-        print(f"[snapshot] saved {png}")
-
-    # ------------------------------------------------------------- settings
-    def save_settings(self) -> None:
-        """Persist the user's choices for the next launch."""
-        data = {
-            "wavelength_nm": self.wavelength_nm,
-            "theme": self.theme_name,
-            "amplitude_v": self.scan_amplitude,
-            "offset_v": self.scan_offset,
-            "sweep_ms": self.scan_sweep_ms,
-            "expand_idx": self.scan_expand_idx,
-            "gain_auto": bool(self.auto_gain),
-            "gain_idx": int(self._manual_gain_idx),
-            "span_mode": self.zoom_span_mode,
-            "span_manual": list(self.zoom_span_manual),
-        }
-        try:
-            with open(SETTINGS_PATH, "w", encoding="utf-8") as fh:
-                json.dump(data, fh, indent=2)
-            print(f"[settings] saved to {os.path.basename(SETTINGS_PATH)}")
-        except Exception as exc:
-            print(f"[settings] could not save: {exc}")
-
-    # ---------------------------------------------------------- uncertainty
-    def _uncertainty_hz(self, res):
-        """1-sigma uncertainty on the linewidth, in Hz.
-
-        Two independent contributions, added in quadrature:
-          * the Lorentzian fit's own covariance on the width, and
-          * the frequency calibration, whose scale (Hz per second of sweep)
-            is set by the FSR peak spacing and jitters sweep to sweep. Its
-            relative error propagates directly into the width.
-        """
-        if not res.ok or not res.linewidth_hz or not res.fsr_period_s:
-            return None
-        self._fsr_hist.append(res.fsr_period_s)
-        rel_cal = 0.0
-        if len(self._fsr_hist) >= 3:
-            arr = np.fromiter(self._fsr_hist, dtype=float)
-            mean = float(arr.mean())
-            if mean > 0:
-                # standard error of the mean period -> relative scale error
-                rel_cal = float(arr.std(ddof=1)) / mean / np.sqrt(len(arr))
-        err_cal = res.linewidth_hz * rel_cal
-        err_fit = 0.0
-        if res.fit_fwhm_err_s and res.hz_per_s:
-            err_fit = res.fit_fwhm_err_s * res.hz_per_s
-        total = float(np.hypot(err_fit, err_cal))
-        return total if np.isfinite(total) and total > 0 else None
+        val = ("Auto" if (self.auto_gain or self.ctrl is None)
+               else self.GAIN_LABELS[self._manual_gain_idx + 1])
+        self.combo_gain.setCurrentIndex(self.GAIN_LABELS.index(val))
 
     # -------------------------------------------- async controller writes
     def _ctrl_do(self, label, fn):
@@ -1521,6 +1084,55 @@ class LiveApp:
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    # ------------------------------------------------------------- settings
+    def save_settings(self) -> None:
+        """Persist the user's choices for the next launch."""
+        data = {
+            "wavelength_nm": self.wavelength_nm,
+            "theme": self.theme_name,
+            "amplitude_v": self.scan_amplitude,
+            "offset_v": self.scan_offset,
+            "sweep_ms": self.scan_sweep_ms,
+            "expand_idx": self.scan_expand_idx,
+            "gain_auto": bool(self.auto_gain),
+            "gain_idx": int(self._manual_gain_idx),
+            "span_mode": self.zoom_span_mode,
+            "span_manual": list(self.zoom_span_manual),
+        }
+        try:
+            with open(SETTINGS_PATH, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+            print(f"[settings] saved to {os.path.basename(SETTINGS_PATH)}")
+        except Exception as exc:
+            print(f"[settings] could not save: {exc}")
+
+    # ---------------------------------------------------------- uncertainty
+    def _uncertainty_hz(self, res):
+        """1-sigma uncertainty on the linewidth, in Hz.
+
+        Two independent contributions, added in quadrature:
+          * the Lorentzian fit's own covariance on the width, and
+          * the frequency calibration, whose scale (Hz per second of sweep)
+            is set by the FSR peak spacing and jitters sweep to sweep. Its
+            relative error propagates directly into the width.
+        """
+        if not res.ok or not res.linewidth_hz or not res.fsr_period_s:
+            return None
+        self._fsr_hist.append(res.fsr_period_s)
+        rel_cal = 0.0
+        if len(self._fsr_hist) >= 3:
+            arr = np.fromiter(self._fsr_hist, dtype=float)
+            mean = float(arr.mean())
+            if mean > 0:
+                # standard error of the mean period -> relative scale error
+                rel_cal = float(arr.std(ddof=1)) / mean / np.sqrt(len(arr))
+        err_cal = res.linewidth_hz * rel_cal
+        err_fit = 0.0
+        if res.fit_fwhm_err_s and res.hz_per_s:
+            err_fit = res.fit_fwhm_err_s * res.hz_per_s
+        total = float(np.hypot(err_fit, err_cal))
+        return total if np.isfinite(total) and total > 0 else None
+
     # ------------------------------------------------------------------ log
     def _log(self, res):
         if self._log_writer is None or res is None:
@@ -1553,8 +1165,91 @@ class LiveApp:
         if int(now) % 5 == 0:
             self._log_file.flush()
 
+    # --------------------------------------------------------------- export
+    def _on_export(self):
+        res = self.last_result
+        if res is None or res.t is None:
+            self.lbl_status.setText("nothing to export yet")
+            return
+        os.makedirs(EXPORT_DIR, exist_ok=True)
+        stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        lam = self.wavelength_nm
+        wrote = []
+
+        sweep_path = os.path.join(EXPORT_DIR, f"sweep_{stamp}.csv")
+        with open(sweep_path, "w", newline="") as fh:
+            fh.write("# SA210 / SA201B / PicoScope 5242D — one sweep\n")
+            fh.write(f"# exported: "
+                     f"{_dt.datetime.now().isoformat(timespec='seconds')}\n")
+            fh.write(f"# wavelength_nm: {lam:g}\n")
+            fh.write(f"# fsr_hz: {self.fsr_hz:g}\n")
+            if res.hz_per_s:
+                fh.write(f"# hz_per_s: {res.hz_per_s:.6g}\n")
+            if res.linewidth_hz:
+                wv, wu = ana.wavelength_width(res.linewidth_hz, lam)
+                fh.write(f"# fwhm_mhz: {res.linewidth_hz / 1e6:.4f}\n")
+                if self._last_err_hz:
+                    fh.write(f"# fwhm_err_mhz_1sigma: "
+                             f"{self._last_err_hz / 1e6:.4f}\n")
+                fh.write(f"# fwhm_wavelength: {wv:.4g} {wu}\n")
+            if res.finesse:
+                fh.write(f"# effective_finesse: {res.finesse:.1f}\n")
+            if res.transverse_frac is not None:
+                fh.write(f"# transverse_frac: {res.transverse_frac:.3f}\n")
+            if self.ctrl is not None:
+                fh.write(f"# pd_gain: {self.GAIN_NAMES[self._gain_cache]}\n")
+            fh.write(f"# mode: {self.mode}\n")
+            w = csv.writer(fh)
+            w.writerow(["time_s", "signal_v", "freq_offset_mhz", "fit_v"])
+            fit_map = {}
+            if res.fit_t is not None:
+                fit_map = {round(float(tt), 12): float(fv)
+                           for tt, fv in zip(res.fit_t, res.fit_v)}
+            calibrated = bool(res.hz_per_s and res.fit_center_s is not None)
+            for tt, vv in zip(res.t, res.v):
+                f_off = (f"{(tt - res.fit_center_s) * res.hz_per_s / 1e6:.6f}"
+                         if calibrated else "")
+                fv = fit_map.get(round(float(tt), 12))
+                w.writerow([f"{tt:.9f}", f"{vv:.6f}", f_off,
+                            "" if fv is None else f"{fv:.6f}"])
+        wrote.append(sweep_path)
+
+        if self.history:
+            hist_path = os.path.join(EXPORT_DIR, f"history_{stamp}.csv")
+            with open(hist_path, "w", newline="") as fh:
+                fh.write(f"# linewidth history — wavelength_nm: {lam:g}\n")
+                w = csv.writer(fh)
+                w.writerow(["iso_time", "elapsed_s", "linewidth_mhz",
+                            "linewidth_pm"])
+                for wall, lw in self.history:
+                    w.writerow([
+                        _dt.datetime.fromtimestamp(wall)
+                        .isoformat(timespec="seconds"),
+                        f"{wall - self.t_start:.2f}",
+                        f"{lw / 1e6:.4f}",
+                        f"{ana.delta_lambda_m(lw, lam) * 1e12:.6f}"])
+            wrote.append(hist_path)
+
+        names = ", ".join(os.path.basename(p) for p in wrote)
+        self.lbl_status.setText(f"exported: {names}")
+        print("[export] " + " | ".join(wrote))
+
+    def _snapshot(self):
+        os.makedirs(LOG_DIR, exist_ok=True)
+        stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        png = os.path.join(LOG_DIR, f"snapshot_{stamp}.png")
+        self.win.grab().save(png)
+        res = self.last_result
+        if res is not None and res.t is not None:
+            csv_path = os.path.join(LOG_DIR, f"snapshot_{stamp}.csv")
+            with open(csv_path, "w", newline="") as fh:
+                w = csv.writer(fh)
+                w.writerow(["time_s", "signal_v"])
+                w.writerows(zip(res.t, res.v))
+        print(f"[snapshot] saved {png}")
+
     # ---------------------------------------------------------------- frame
-    def _update(self, _frame):
+    def _update(self, _frame=0):
         if self.paused or self.acq is None:
             return
         self._ctrl_watchdog()      # re-attach the SA201B if its USB returns
@@ -1565,7 +1260,6 @@ class LiveApp:
             if not self._armed or item[0] < self._arm_time:
                 return      # frozen, or waiting for a sweep newer than the click
         self._last_processed = item[0]
-        t_frame0 = time.perf_counter()
         wall, cap = item
         if self.mode == "single":
             self._armed = False
@@ -1617,30 +1311,33 @@ class LiveApp:
         if not self.align_mode:      # alignment sweeps don't pollute the log
             self._log(res)
 
-        changed = self._bg is None
-
-        # ---- full sweep panel (envelope-decimated for fast redraws; when
-        # the user has zoomed in, decimate only the visible span so close-ups
-        # show the raw samples instead of the min/max envelope pairs)
+        # ---- full sweep panel
         t_ms = t * 1e3
-        if self._user_zoom.get((id(self.ax_sweep), "x")):
-            vlo, vhi = self.ax_sweep.get_xlim()
-            ssel = (t_ms >= vlo) & (t_ms <= vhi)
-            sx, sy = (_decimate_envelope(t_ms[ssel], v[ssel])
-                      if ssel.sum() > 2 else (t_ms, v))
-        else:
-            sx, sy = _decimate_envelope(t_ms, v)
-        self.ln_sweep.set_data(sx, sy)
-        self.mk_peaks.set_data(res.peak_times * 1e3,
-                               res.peak_heights + 0.06 * max(1e-3, np.max(v)))
-        changed |= self._lim(self.ax_sweep, "x", t[0] * 1e3, t[-1] * 1e3,
-                             exact=True)
+        self.ln_sweep.setData(t_ms, v)
         top = max(0.5, float(np.max(v)) * 1.25)
-        changed |= self._lim(self.ax_sweep, "y", -0.04 * top, top)
+        if len(res.peak_times):
+            self.mk_peaks.setData(x=res.peak_times * 1e3,
+                                  y=res.peak_heights
+                                  + 0.06 * max(1e-3, float(np.max(v))))
+        else:
+            self.mk_peaks.setData(x=[], y=[])
+        self._auto_range["sweep"] = ((float(t_ms[0]), float(t_ms[-1])),
+                                     (-0.04 * top, top))
+        if not self._user_zoom["sweep"]:
+            vb = self.p_sweep.getViewBox()
+            vb.setXRange(t_ms[0], t_ms[-1], padding=0)
+            vb.setYRange(-0.04 * top, top, padding=0)
 
-        # ---- zoom panel
+        # ---- calibrated peak panel
         if res.ok and res.hz_per_s and res.fit_center_s is not None:
             f_off = (t - res.fit_center_s) * res.hz_per_s / 1e6
+            self.ln_zoom.setData(f_off, v)
+            if res.fit_t is not None:
+                self.ln_fit.setData(
+                    (res.fit_t - res.fit_center_s) * res.hz_per_s / 1e6,
+                    res.fit_v)
+            else:
+                self.ln_fit.setData([], [])
             half_fsr = self.fsr_hz / 2e6
             if self.zoom_span_mode == "full":
                 xlo, xhi = -half_fsr, half_fsr
@@ -1653,27 +1350,14 @@ class LiveApp:
                 span = float(np.clip(
                     max(12 * lw_mhz, 1.3 * biggest_mode + 300),
                     250, 0.45 * self.fsr_hz / 1e6))
-                for q in (250.0, 500.0, 1000.0, 2000.0, 4500.0):
-                    if span <= q:    # quantize so the limits rarely move
-                        span = q
-                        break
                 xlo, xhi = -span, span
-            if self._user_zoom.get((id(self.ax_zoom), "x")):
-                vlo, vhi = self.ax_zoom.get_xlim()   # follow the drag zoom
-            else:
-                vlo, vhi = xlo, xhi
-            sel = (f_off >= vlo) & (f_off <= vhi)
-            zx, zy = _decimate_envelope(f_off[sel], v[sel])
-            self.ln_zoom.set_data(zx, zy)
-            if res.fit_t is not None:
-                self.ln_fit.set_data(
-                    (res.fit_t - res.fit_center_s) * res.hz_per_s / 1e6,
-                    res.fit_v)
-            else:
-                self.ln_fit.set_data([], [])
-            changed |= self._lim(self.ax_zoom, "x", xlo, xhi, exact=True)
+            sel = (f_off >= xlo) & (f_off <= xhi)
             ztop = max(0.2, float(np.max(v[sel])) * 1.2) if sel.any() else 1.0
-            changed |= self._lim(self.ax_zoom, "y", -0.04 * ztop, ztop)
+            self._auto_range["peak"] = ((xlo, xhi), (-0.04 * ztop, ztop))
+            if not self._user_zoom["peak"]:
+                vb = self.p_peak.getViewBox()
+                vb.setXRange(xlo, xhi, padding=0)
+                vb.setYRange(-0.04 * ztop, ztop, padding=0)
 
         # ---- trend panel (live mode waits out the median warm-up so the
         # first seconds can't seed the history with raw jitter samples)
@@ -1690,83 +1374,66 @@ class LiveApp:
         if self.history:
             xs = np.array([w - self.t_start for w, _ in self.history])
             ys = np.array([lw / 1e6 for _, lw in self.history])
-            if self._user_zoom.get((id(self.ax_trend), "x")):
-                vlo, vhi = self.ax_trend.get_xlim()
-                tsel = (xs >= vlo) & (xs <= vhi)
-                dx, dy = ((xs[tsel], ys[tsel]) if 2 < tsel.sum() <= 480
-                          else _decimate_envelope(xs, ys, max_bins=240))
-            else:
-                dx, dy = _decimate_envelope(xs, ys, max_bins=240)
-            self.ln_trend.set_data(dx, dy)
+            self.ln_trend.setData(xs, ys)
             if self.mode == "live":
-                # quantize the scroll to 10 s steps so the background (and
-                # tick labels) only regenerate occasionally, not every frame
-                right = max(10.0, np.ceil(xs[-1] / 10.0) * 10.0)
-                left = max(0.0, right - self.args.history_s)
-                changed |= self._lim(self.ax_trend, "x", left, right,
-                                     exact=True)
+                tx = (max(0.0, xs[-1] - self.args.history_s),
+                      max(10.0, xs[-1] * 1.02))
             else:
-                changed |= self._lim(self.ax_trend, "x",
-                                     max(0.0, xs[0] - 5.0),
-                                     max(10.0, xs[-1] + 5.0))
+                tx = (max(0.0, xs[0] - 5.0), max(10.0, xs[-1] + 5.0))
             lo, hi = float(ys.min()), float(ys.max())
             pad = max(2.0, 0.15 * (hi - lo))
-            changed |= self._lim(self.ax_trend, "y", max(0.0, lo - pad),
-                                 hi + pad)
+            ty = (max(0.0, lo - pad), hi + pad)
+            self._auto_range["trend"] = (tx, ty)
+            if not self._user_zoom["trend"]:
+                vb = self.p_trend.getViewBox()
+                vb.setXRange(*tx, padding=0)
+                vb.setYRange(*ty, padding=0)
 
         # ---- readouts
         if self.align_mode:
             peak_v = float(np.max(v)) if len(v) else 0.0
-            self.txt_head.set_text(f"{peak_v:.3f} V")
+            self.lbl_head.setText(f"{peak_v:.3f} V")
             sub = "alignment — maximize peak height (triangle scan)"
             if res.transverse_frac is not None:
                 sub = (f"alignment — peak height up, transverse "
                        f"{res.transverse_frac * 100:.0f}% down")
-            self.txt_sub.set_text(sub)
+            self.lbl_sub.setText(sub)
         elif res.ok and res.linewidth_hz:
             show = self._disp_lw_hz or res.linewidth_hz
             err = self._last_err_hz
             head = f"{show / 1e6:.1f}"
             if err:
                 head += f" ± {err / 1e6:.1f}"
-            self.txt_head.set_text(head + " MHz")
+            self.lbl_head.setText(head + " MHz")
             wl_v, wl_u = ana.wavelength_width(show, self.wavelength_nm)
             deconv = max(show - self.instrument_hz, 0.0)
             note = ("instrument-limited"
                     if show < 1.35 * self.instrument_hz
                     else f"est. laser ≈ {deconv / 1e6:.0f} MHz "
                          f"(67 MHz removed)")
-            self.txt_sub.set_text(
+            self.lbl_sub.setText(
                 f"= {wl_v:.3g} {wl_u} @ {self.wavelength_nm:g} nm — {note}")
         else:
-            self.txt_head.set_text("—")
-            self.txt_sub.set_text("")
+            self.lbl_head.setText("—")
+            self.lbl_sub.setText("")
 
-        # NOTE: the stats block lives in the cached background, and every
-        # change to its string costs one ~230 ms full redraw -- so values
-        # here are quantized coarsely enough to be stable between sweeps
-        # (the live headline carries the precise numbers).
         stats = []
         if self.mode == "single" and self._last_single_stamp:
             stats.append(f"single sweep captured {self._last_single_stamp}")
-        sc = self._shown("scatter", self._lw_scatter_hz, 0.2e6)
-        if sc:
-            stats.append(f"sweep-to-sweep scatter: ±{sc / 1e6:.1f} MHz "
-                         f"(jitter, median of {self._lw_recent.maxlen})")
-        dw = self._shown("direct", res.linewidth_direct_hz, 2e6)
-        if dw:
-            stats.append(f"half-max width: {dw / 1e6:.0f} MHz")
-        r2 = self._shown("r2", res.fit_r2, 0.02)
-        if r2 is not None:
-            stats.append(f"fit R²: {r2:.2f}")
-        fin = self._shown("finesse", res.finesse, 15)
-        if fin:
-            stats.append(f"effective finesse: ~{round(fin / 10) * 10}"
-                         f"  (spec >150)")
-        fsr_ms = self._shown("fsr", res.fsr_period_s, 0.05e-3)
-        if fsr_ms:
-            stats.append(f"FSR spacing: {fsr_ms * 1e3:.2f} ms "
-                         f"→ {self.fsr_hz / fsr_ms / 1e12:.2f} GHz/ms")
+        if self._lw_scatter_hz:
+            stats.append(f"sweep-to-sweep scatter: "
+                         f"±{self._lw_scatter_hz / 1e6:.2f} MHz (jitter, "
+                         f"median of {self._lw_recent.maxlen})")
+        if res.linewidth_direct_hz:
+            stats.append(f"half-max width: "
+                         f"{res.linewidth_direct_hz / 1e6:.1f} MHz")
+        if res.fit_r2 is not None:
+            stats.append(f"fit R²: {res.fit_r2:.3f}")
+        if res.finesse:
+            stats.append(f"effective finesse: {res.finesse:.0f}  (spec >150)")
+        if res.fsr_period_s:
+            stats.append(f"FSR spacing: {res.fsr_period_s * 1e3:.2f} ms "
+                         f"→ {res.hz_per_s / 1e12:.2f} GHz/ms")
         n_modes = len(res.mode_offsets_hz)
         if n_modes > 1:
             spacings = np.diff(sorted(res.mode_offsets_hz)) / 1e6
@@ -1774,8 +1441,8 @@ class LiveApp:
                          f"(spacing {', '.join(f'{s:.0f}' for s in spacings)} MHz)")
         elif res.ok:
             stats.append("modes in one FSR: 1 (single-frequency)")
-        frac = self._shown("trans", res.transverse_frac, 0.04)
-        if frac is not None:
+        if res.transverse_frac is not None:
+            frac = res.transverse_frac
             tag = ("good" if frac < 0.05 else
                    "fair" if frac < 0.20 else "poor")
             stats.append(f"transverse modes: {frac * 100:.0f}% of main "
@@ -1792,18 +1459,11 @@ class LiveApp:
         if self.align_mode:
             stats.append("ALIGNMENT MODE — triangle scan, not logged")
         if self.mode == "live" and self.acq.sweep_period_s:
-            rate = self._shown("rate", 1.0 / self.acq.sweep_period_s, 2.0)
-            stats.append(f"sweep rate: {rate:.0f} Hz"
+            stats.append(f"sweep rate: {1.0 / self.acq.sweep_period_s:.0f} Hz"
                          f"   window: {self.acq.window_s * 1e3:.0f} ms")
         if self.log_path:
             stats.append(f"log: {os.path.basename(self.log_path)}")
-        new_stats = "\n".join(stats)
-        self.txt_stats.set_text(new_stats)
-        # stats live in the background; re-bake (full draw) at most every
-        # 2.5 s when the content actually changed
-        if (new_stats != getattr(self, "_stats_shown", None)
-                and time.monotonic() - self._stats_baked_at > 6.0):
-            changed = True
+        self.lbl_stats.setText("\n".join(stats))
 
         warn = []
         if not res.ok:
@@ -1822,52 +1482,36 @@ class LiveApp:
             warn.append("! SA201B USB disconnected — retrying...")
         if self.acq.status not in ("ok", "starting"):
             warn.append(self.acq.status)
-        self.txt_status.set_text("\n".join(warn))
-
-        # ---- render: blit the dynamic artists; full draw only when the
-        # axis furniture (limits/ticks) actually changed
-        if changed or self._bg is None:
-            self.fig.canvas.draw()       # _on_draw refreshes the background
-        else:
-            self._blit()
-
-        # adaptive pacing: the render loop may never occupy more than ~50%
-        # of the event loop, whatever this frame cost on this screen -- so
-        # mouse clicks and typing always have idle time to run in
-        frame_ms = (time.perf_counter() - t_frame0) * 1e3
-        tmr = getattr(self, "_timer", None)
-        if tmr is not None:
-            try:
-                tmr.interval = int(min(1000.0, max(150.0, 2.0 * frame_ms)))
-            except Exception:
-                pass
+        self.lbl_status.setText("\n".join(warn))
 
     # ------------------------------------------------------------------ run
+    def _cleanup(self):
+        if self._cleaned_up:
+            return
+        self._cleaned_up = True
+        tmr = getattr(self, "_timer", None)
+        if tmr is not None:
+            tmr.stop()
+        self.save_settings()
+        self.acq.shutdown()          # aborts in-flight captures, closes scope
+        if self.ctrl is not None:
+            self.ctrl.close()
+        if self._log_file is not None:
+            self._log_file.close()
+            print(f"[log] {self.log_path}")
+        print("[exit] scope released")
+
     def run(self):
         self.acq.start()
-        # A plain canvas timer instead of FuncAnimation: FuncAnimation forces
-        # a full ~100 ms canvas redraw on every tick even when nothing
-        # changed, which saturates the Tk event loop and lags the mouse.
-        # Blit frames cost ~15-25 ms, so ~7 Hz still leaves the event loop
-        # mostly idle for mouse and widget traffic.
-        self._timer = self.fig.canvas.new_timer(interval=150)
-        self._timer.add_callback(self._update, 0)
-        self._timer.start()
+        self._timer = QtCore.QTimer()
+        self._timer.timeout.connect(self._update)
+        self._timer.start(120)
+        self.win.showMaximized()
+        print("[ui] close the window or press q to stop")
         try:
-            self.plt.show()
+            self._qapp.exec()
         finally:
-            try:
-                self._timer.stop()
-            except Exception:
-                pass
-            self.save_settings()
-            self.acq.shutdown()          # aborts in-flight captures, closes scope
-            if self.ctrl is not None:
-                self.ctrl.close()
-            if self._log_file is not None:
-                self._log_file.close()
-                print(f"[log] {self.log_path}")
-            print("[exit] scope released")
+            self._cleanup()
 
 
 def main():
@@ -1891,7 +1535,6 @@ def main():
                 return 2
             print("[startup] retrying in 5 s ...")
             time.sleep(5)
-    print("[ui] close the window or press q to stop")
     app.run()
 
 

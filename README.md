@@ -29,7 +29,7 @@ the mirror moves λ/4 per free spectral range.
 
 1. Windows 10/11 with Python 3.12+ (`winget install Python.Python.3.12`).
 2. `pip install -r requirements.txt`
-   (numpy, scipy, matplotlib, pyserial, picosdk).
+   (numpy, scipy, PySide6, pyqtgraph, pyserial, picosdk).
 3. Install **PicoSDK 64-bit** from
    [picotech.com/downloads](https://www.picotech.com/downloads) — provides
    `ps5000a.dll` (default location `C:\Program Files\Pico Technology\SDK`,
@@ -211,8 +211,8 @@ with a `#` metadata header: λ, FSR, calibration, FWHM in MHz and pm, finesse,
 gain) and `history_*.csv` (the linewidth-vs-time trend in MHz and pm). Works
 in live or single mode.
 
-**Graph 2 x-range.** Above the "Main peak" graph is an **x-range** control
-with three modes:
+**Graph 2 x-range.** The **x-range** control in the header bar right above
+the "Main peak" graph picks its window, with three modes:
 
 * **Auto** (default) — the window follows the fitted linewidth and any
   neighbouring modes, as it always has.
@@ -228,13 +228,13 @@ The choice is remembered between sessions. A drag-zoom on that graph
 temporarily overrides the mode; **reset view** returns to it.
 
 **Zoom:** drag with the left mouse button anywhere on a graph to zoom into
-that box — this works **while data is streaming**. Auto-scaling for that
-graph pauses so your view stays put, and its **reset view** button (above the
-graph's top-right corner) lights up; press it to zoom back out and resume
-auto-scaling. A wide, flat drag zooms only the x-axis and leaves y
-auto-scaling — and vice versa — so you can rescale one dimension at a time.
-Small drags (< 8 px) are treated as clicks and ignored. The `v` key resets
-all three graphs at once.
+that box — this works **while data is streaming**. The scroll wheel zooms
+around the cursor, and dragging or scrolling on an axis rescales that axis
+alone. Any of these pauses auto-scaling for that graph so your view stays
+put, and its **reset view** button beside the graph turns bold; press it to
+zoom back out and resume auto-scaling. Zoomed-in views show the raw samples
+(the display only downsamples what a full view can't resolve). The `v` key
+resets all three graphs at once.
 
 **Theme:** the app starts in **dark mode**; the button in the top-right
 corner (or the `d` key) switches between dark and light. Launch with
@@ -292,7 +292,7 @@ no instrument drivers** (numpy + scipy only), so it runs in CI on every push
 
 ## Requirements
 
-Python 3.12 with `numpy scipy matplotlib pyserial picosdk`
+Python 3.12 with `numpy scipy PySide6 pyqtgraph pyserial picosdk`
 (`pip install -r requirements.txt`) and the Pico Technology **PicoSDK**
 (provides `ps5000a.dll`; installed at `C:\Program Files\Pico Technology\SDK`).
 Close the PicoScope 7 desktop app before running — only one program can own
