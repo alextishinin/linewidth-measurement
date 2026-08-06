@@ -367,6 +367,11 @@ panel with the headline readout, statistics, and all input controls.</div>
 <tr><td><b>Light / Dark</b> button (top right)</td><td>Toggles the color theme
   (the label names the theme you would switch <i>to</i>). Dark is the default;
   the choice is persisted. Also key <span class="kbd">d</span>.</td></tr>
+<tr><td><b>Full / Window</b> button (top right)</td><td>Toggles full-screen —
+  the window covers the whole monitor with no title bar or taskbar, suiting
+  the dedicated bench display. Also <span class="kbd">F11</span>;
+  <span class="kbd">Esc</span> exits. The state is persisted, so a kiosk left
+  in full screen starts in full screen.</td></tr>
 <tr><td><b>laser λ nm (100–5000)</b></td><td>The laser wavelength. Feeds the
   Δλ display (the linewidth in pm/fm), the exported files, the CSV log, and
   the piezo calibration prior (section 7). Type a value and press Enter.
@@ -456,6 +461,8 @@ and missing-trigger conditions appear here and clear automatically.</p>
     <td><span class="kbd">p</span></td><td>pause / resume the display</td></tr>
 <tr><td><span class="kbd">←</span> / <span class="kbd">→</span></td><td>DC offset ±0.25 V</td>
     <td><span class="kbd">q</span></td><td>quit (identical to closing the window)</td></tr>
+<tr><td><span class="kbd">F11</span></td><td>toggle full screen</td>
+    <td><span class="kbd">Esc</span></td><td>exit full screen</td></tr>
 </table>
 <p>Keys are ignored while the cursor is in an input box.</p>
 
@@ -585,8 +592,8 @@ sweep (<code>time_s, signal_v</code>) — a quick lab-notebook record.</p>
 <h2>8.4 settings.json (automatic persistence)</h2>
 <p>On every exit the app writes <code>settings.json</code> next to the program and
 restores it on launch: wavelength, theme, ramp amplitude / offset / sweep time /
-expansion, gain choice (auto or fixed index), and the graph-2 x-range mode and
-manual bounds. Precedence at startup:
+expansion, gain choice (auto or fixed index), the graph-2 x-range mode and
+manual bounds, and the full-screen state. Precedence at startup:
 <b>explicit CLI flag → saved value → built-in default</b> — so a one-off
 <code>--wavelength-nm 780</code> wins for that session without overwriting your
 saved setup. Delete <code>settings.json</code> to return to factory defaults.</p>

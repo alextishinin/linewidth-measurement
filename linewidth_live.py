@@ -14,6 +14,7 @@ Keys (ignored while typing in an input box):
   g  cycle PD amplifier gain          a  toggle auto-gain
   e  export displayed data to CSV    s  snapshot (PNG + raw CSV)
   d  dark/light theme                v  reset all zoomed views
+  F11  toggle full screen (Esc exits)
   left/right  nudge DC offset        p  pause display   q  quit
 """
 from __future__ import annotations
@@ -594,6 +595,11 @@ class LiveApp:
         self.btn_theme.clicked.connect(self._on_toggle_theme)
         top_row.addWidget(self.btn_theme,
                           alignment=QtCore.Qt.AlignmentFlag.AlignTop)
+        self.btn_full = QtWidgets.QPushButton("")
+        self.btn_full.setFixedWidth(64)
+        self.btn_full.clicked.connect(self._on_toggle_fullscreen)
+        top_row.addWidget(self.btn_full,
+                          alignment=QtCore.Qt.AlignmentFlag.AlignTop)
         side.addLayout(top_row)
 
         self.lbl_sub = QtWidgets.QLabel("")
@@ -658,13 +664,15 @@ class LiveApp:
         self.lbl_keys = QtWidgets.QLabel(
             "r run · m mode · t align · g gain · a auto\n"
             "e export · s snap · d theme · v reset views\n"
-            "p pause · q quit · drag on a graph to zoom")
+            "F11 full screen · p pause · q quit\n"
+            "drag on a graph to zoom")
         side.addWidget(self.lbl_keys)
 
         self._sync_mode_button()
         self._sync_gain_combo()
         self._sync_expand_combo()
         self._sync_span_widgets()
+        self._sync_full_button()
         if self.mode == "single":
             self.lbl_stats.setText('single mode — press "Run once" (or r) '
                                    "to capture a sweep")
@@ -686,6 +694,12 @@ class LiveApp:
             self._on_toggle_align()
         elif key == K.Key_D:
             self._on_toggle_theme()
+        elif key == K.Key_F11:
+            self._on_toggle_fullscreen()
+        elif key == K.Key_Escape:
+            if not self.win.isFullScreen():
+                return False
+            self._on_toggle_fullscreen()
         elif key == K.Key_S:
             self._snapshot()
         elif key == K.Key_E:
@@ -738,6 +752,19 @@ class LiveApp:
             f = b.font()
             f.setBold(self._user_zoom[name])
             b.setFont(f)
+
+    # ----------------------------------------------------------- fullscreen
+    def _on_toggle_fullscreen(self):
+        if self.win.isFullScreen():
+            self.win.showMaximized()
+        else:
+            self.win.showFullScreen()
+        self._sync_full_button()
+
+    def _sync_full_button(self):
+        # like the theme button, the label names the state you switch TO
+        self.btn_full.setText(
+            "Window" if self.win.isFullScreen() else "Full")
 
     # ---------------------------------------------------------------- theme
     def _on_toggle_theme(self):
@@ -1098,6 +1125,7 @@ class LiveApp:
             "gain_idx": int(self._manual_gain_idx),
             "span_mode": self.zoom_span_mode,
             "span_manual": list(self.zoom_span_manual),
+            "fullscreen": bool(self.win.isFullScreen()),
         }
         try:
             with open(SETTINGS_PATH, "w", encoding="utf-8") as fh:
@@ -1506,7 +1534,11 @@ class LiveApp:
         self._timer = QtCore.QTimer()
         self._timer.timeout.connect(self._update)
         self._timer.start(120)
-        self.win.showMaximized()
+        if load_saved_settings().get("fullscreen", False):
+            self.win.showFullScreen()
+        else:
+            self.win.showMaximized()
+        self._sync_full_button()
         print("[ui] close the window or press q to stop")
         try:
             self._qapp.exec()

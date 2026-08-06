@@ -245,8 +245,9 @@ corner (or the `d` key) switches between dark and light. Launch with
 `--theme light` to start light. Snapshots save in whichever theme is active.
 
 **Settings are remembered.** On exit the app writes `settings.json`
-(wavelength, theme, ramp amplitude/offset/sweep time/expansion, and the gain
-choice) and restores them next launch. Precedence is
+(wavelength, theme, ramp amplitude/offset/sweep time/expansion, the gain
+choice, the graph-2 x-range, and the full-screen state) and restores them
+next launch. Precedence is
 *explicit command-line flag → saved value → built-in default*, so
 `--wavelength-nm 780` still wins for one session without overwriting your
 saved setup until you exit. Delete `settings.json` to return to defaults.
@@ -257,11 +258,15 @@ controller keeps ramping on its own), shows
 soon as the port reappears — re-applying amplitude, offset, sweep time,
 expansion, gain and waveform so the session continues unchanged.
 
+**Full screen:** the **Full** button next to the theme toggle (or `F11`)
+hides the title bar and taskbar — handy for the dedicated bench monitor;
+`Esc` or the button exits. The state is remembered between sessions.
+
 **Keys:** `r` run one sweep · `m` live/single mode · `t` alignment mode ·
 `g` cycle PD gain · `a` toggle auto-gain · `e` export data · `d` theme ·
 `v` reset all zoomed views · `←/→` DC offset ±0.25 V · `s` snapshot PNG+CSV ·
-`p` pause display · `q` quit. (Keys are ignored while typing in any input
-box.)
+`F11` full screen (`Esc` exits) · `p` pause display · `q` quit. (Keys are
+ignored while typing in any input box.)
 
 ## Interpreting the display
 
